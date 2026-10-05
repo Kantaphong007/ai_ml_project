@@ -1,0 +1,11 @@
+{
+  "smoothing": 5,
+  "speed": 1.0,
+  "camera": 0,
+  "mirror": true,
+  "invert_x": false,
+  "invert_y": false,
+  "dwell_time": 800,
+  "keyboard_opacity": 85,
+  "show_overlay": true
+}
