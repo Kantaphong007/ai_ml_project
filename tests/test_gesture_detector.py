@@ -123,6 +123,74 @@ def test_cursor_frozen_during_wink_and_released_after():
     assert frozen_end is False         # ปล่อยหลังลืมตาแล้ว
 
 
+def run_fn(fn, dur, det=None, t0=0.0, seed=2, noise=0.008):
+    """fn(t) → (ear_l, ear_r, smile) ต่อเนื่องตามเวลา"""
+    rnd = random.Random(seed)
+    det = det or GestureDetector(OPEN, OPEN)
+    t, out = t0, []
+    while t < t0 + dur:
+        el, er, sm = fn(t)
+        out += [(e, round(t, 2)) for e in det.update(t, el + rnd.gauss(0, noise),
+                                                     er + rnd.gauss(0, noise), sm)]
+        t += DT
+    return out, det
+
+
+def test_wink_while_open_eye_is_dragged_half_closed():
+    # MediaPipe มักลากตาที่เปิดอยู่ให้หรี่ตาม (เหลือ ~65%) ตอนขยิบ → ต้องยังเป็นขยิบซ้าย
+    out, _ = run([(1, OPEN, OPEN), (0.5, CLOSED, OPEN * 0.62), (1, OPEN, OPEN)])
+    assert names(out) == ["left_click"]
+
+
+def test_right_wink_with_coupling():
+    out, _ = run([(1, OPEN, OPEN), (0.5, OPEN * 0.6, CLOSED), (1, OPEN, OPEN)])
+    assert names(out) == ["right_click"]
+
+
+def _tilt(t, start=1.0, ramp=0.8, depth=0.62):
+    """ก้มหน้า: EAR สองตาลดลงช้าๆ เหลือ depth ของค่าเปิด"""
+    k = min(1.0, max(0.0, (t - start) / ramp))
+    return OPEN * (1 - (1 - depth) * k)
+
+
+def test_head_tilt_lowers_both_eyes_no_event_no_stuck_freeze():
+    out, det = run_fn(lambda t: (_tilt(t), _tilt(t), 0.0), 5.0)
+    assert out == []
+    assert det.freeze_cursor is False     # ไม่ตรึงเคอร์เซอร์ค้างตอนก้มไปมองขอบล่างของจอ
+
+
+def test_wink_still_works_after_head_tilt():
+    def fn(t):
+        e = _tilt(t)
+        return (CLOSED if 4.0 <= t < 4.5 else e), e, 0.0
+    out, _ = run_fn(fn, 6.0)
+    assert names(out) == ["left_click"]
+
+
+def test_learns_reference_without_baseline():
+    # ไม่มี baseline: ค่าเริ่ม 0.30 แต่ตาผู้ใช้เปิดแค่ 0.18 → ห้ามคลิกมั่ว และต้องขยิบได้หลังเรียนค่า
+    det = GestureDetector(0.30, 0.30)
+    det.set_reference(0.30, 0.30, trusted=False)
+    small = 0.18
+    out, _ = run_fn(lambda t: ((0.03 if 2.0 <= t < 2.5 else small), small, 0.0), 4.0, det=det, noise=0.005)
+    assert names(out) == ["left_click"]
+
+
+def test_shallow_double_blink_ignored():
+    # กะพริบตื้นๆ (ตาไม่ปิดจริง) สองครั้ง ≠ ดับเบิลคลิก
+    half = OPEN * 0.58
+    out, _ = run([(1, OPEN, OPEN), (0.12, half, half), (0.2, OPEN, OPEN),
+                  (0.12, half, half), (1, OPEN, OPEN)], noise=0.004)
+    assert out == []
+
+
+def test_one_frame_dropout_does_not_split_wink():
+    # landmark กระตุกเปิด 1 เฟรมกลางการขยิบ → ยังเป็นคลิกเดียว
+    out, _ = run([(1, OPEN, OPEN), (0.25, CLOSED, OPEN), (DT, OPEN, OPEN),
+                  (0.25, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.0)
+    assert names(out) == ["left_click"]
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

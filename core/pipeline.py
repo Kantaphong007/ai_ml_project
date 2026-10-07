@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.camera import CameraStream
 from core.face_mesh import FaceMeshDetector
-from core.feature_extractor import FeatureExtractor
+from core.feature_extractor import FeatureExtractor, EAR_VERSION
 from core.cursor_predictor import CursorPredictor
 from core.click_classifier import ClickClassifier
 from core.gesture_detector import GestureDetector
@@ -25,17 +25,16 @@ from config.settings import (
     CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT, FPS, MIRROR_CAMERA,
     BASELINE_DATA_PATH, SCREEN_WIDTH, SCREEN_HEIGHT
 )
+from config.tuning import load_tuning, TUNING_PATH
 
 # ตำแหน่งเคอร์เซอร์ที่ "ก่อนเริ่มทำท่า" — ย้อนกลับกี่เฟรมตอนเริ่มตรึง
 # (ตายังปิดไม่ถึง threshold ตอนที่หัว/ใบหน้าเริ่มขยับไปแล้ว 2–3 เฟรม)
 _REWIND_FRAMES = 3
 # เฟรมที่ไม่เจอหน้าติดกันเกินนี้ (วินาที) ให้ล้างตัวกรอง กันเคอร์เซอร์พุ่งจากค่าเก่า
 _FACE_LOST_RESET_S = 0.5
-# โหมด scroll: ระยะ (พิกเซลจอ) ที่ต้องก้ม/เงยจากจุดเริ่มก่อนเลื่อน และความเร็ว
-_SCROLL_DEADZONE_PX = 80
-_SCROLL_FULL_SPEED_PX = 400
-_SCROLL_MAX_NOTCH_PER_S = 12
 _VK_PAUSE = 0x13
+# event จากตาที่ไม่ทำงานในโหมด scroll (ก้ม/เงยทำให้ EAR เปลี่ยน เสี่ยงคลิกโดยไม่ตั้งใจ)
+_EYE_EVENTS = ("left_click", "right_click", "double_click", "drag_toggle")
 
 
 class Pipeline:
@@ -58,12 +57,13 @@ class Pipeline:
     def __init__(self):
         self.camera = CameraStream(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT, FPS, mirror=MIRROR_CAMERA)
         self.detector = FaceMeshDetector()
-        self.extractor = FeatureExtractor(self.detector)
+        self.extractor = FeatureExtractor(self.detector, (FRAME_WIDTH, FRAME_HEIGHT))
+        self.gesture_params, self.scroll_params = load_tuning()
         self.cursor_predictor = CursorPredictor()
         # click_classifier (ML) ยังโหลดไว้ใช้ประเมิน/รายงาน แต่ไม่อยู่ในเส้นทางสั่งคลิกสด
         # เพราะข้อมูลเทรนเดิมเป็นข้อมูลสังเคราะห์ ไม่ตรงกับสัญญาณตาจริง
         self.click_classifier = ClickClassifier()
-        self.gesture_detector = GestureDetector()
+        self.gesture_detector = GestureDetector(params=self.gesture_params)
         self.mouse_controller = MouseController()
 
         self._running = False
@@ -87,6 +87,11 @@ class Pipeline:
             "confidence": 0.0,
             "locked": False,   # True = เคอร์เซอร์ถูกตรึงระหว่างทำท่าทาง
             "paused": False,
+            # สำหรับดู/จูนค่า
+            "gesture_state": "idle",
+            "ratio_l": 1.0,
+            "ratio_r": 1.0,
+            "scroll_offset": 0.0,   # ก้ม(+)/เงย(−) เทียบจุดอ้างอิงของโหมด scroll
         }
 
         # Callback สำหรับ UI
@@ -104,18 +109,30 @@ class Pipeline:
         """
         print("  🔄 กำลังเตรียมระบบ...")
 
-        ref_l = ref_r = 0.30
+        # ค่าที่จูนจากข้อมูล (โหลดใหม่ทุกครั้งที่เริ่ม → จูนแล้วกด Start ใหม่ได้เลย)
+        self.gesture_params, self.scroll_params = load_tuning()
+        self.gesture_detector.set_params(self.gesture_params)
+        if os.path.exists(TUNING_PATH):
+            print(f"  ✅ โหลดค่าที่จูนแล้ว: {TUNING_PATH}")
+
+        baseline = None
         if os.path.exists(BASELINE_DATA_PATH):
             with open(BASELINE_DATA_PATH, 'r') as f:
                 baseline = json.load(f)
-            self.extractor.set_baseline_mouth_width(baseline["baseline_mouth_width"])
-            ref_l = baseline.get("baseline_ear_l", ref_l)
-            ref_r = baseline.get("baseline_ear_r", ref_r)
-            print(f"  ✅ โหลดค่าฐาน: mouth={baseline['baseline_mouth_width']:.4f} "
+        if baseline and baseline.get("ear_version") == EAR_VERSION:
+            ref_l, ref_r = baseline["baseline_ear_l"], baseline["baseline_ear_r"]
+            if not self.camera.mirror:      # detector รับ EAR ตามตาจริงของผู้ใช้ (ดู _loop)
+                ref_l, ref_r = ref_r, ref_l
+            self.extractor.set_baseline_mouth_ratio(baseline.get("baseline_mouth_ratio"))
+            self.gesture_detector.set_reference(ref_l, ref_r, trusted=True)
+            print(f"  ✅ โหลดค่าฐาน: mouth_ratio={baseline.get('baseline_mouth_ratio', 0):.4f} "
                   f"EAR_L={ref_l:.3f} EAR_R={ref_r:.3f}")
         else:
-            print("  ⚠️ ไม่พบค่าฐาน — ใช้ค่าเริ่มต้น (ยิ้มเพื่อ Scroll อาจไม่แม่นยำ กรุณากด Baseline)")
-        self.gesture_detector.set_reference(ref_l, ref_r)
+            # ไม่มีค่าฐาน หรือเป็นค่าฐานเวอร์ชันเก่า (คนละสเกล) → เรียนจากกล้องเองใน ~0.5 วิแรก
+            self.extractor.set_baseline_mouth_ratio(None)
+            self.gesture_detector.set_reference(0.28, 0.28, trusted=False)
+            print("  ⚠️ ไม่พบค่าฐานเวอร์ชันปัจจุบัน — ระบบจะเรียนค่าตา/ปากจากกล้องเอง "
+                  "(แนะนำกด Baseline ใหม่ 1 ครั้ง)")
 
         cursor_ok = self.cursor_predictor.load()
         if not cursor_ok:
@@ -151,9 +168,8 @@ class Pipeline:
     def _reset_runtime_state(self):
         self._pos_history = deque(maxlen=_REWIND_FRAMES + 1)
         self._locked_pos = None
-        self._scroll_anchor_y = None
-        self._scroll_accum = 0.0
-        self._last_scroll_t = None
+        self._scroll_pos = None
+        self._reset_scroll_tracking()
         self._last_face_t = time.perf_counter()
         self._last_frame_id = -1
         self._status["mode"] = "normal"
@@ -215,6 +231,7 @@ class Pipeline:
             self._pos_history.clear()
             self._locked_pos = None
             self._status["locked"] = False
+            self._reset_scroll_tracking()   # กลับมาแล้วตั้งจุดอ้างอิงใหม่ (ท่านั่งอาจเปลี่ยน)
             if self.mouse_controller.is_dragging:
                 self.mouse_controller.mouse_up()
                 self._status["mode"] = "normal"
@@ -222,6 +239,7 @@ class Pipeline:
 
     def _process_landmarks(self, landmarks, now, swap_eyes):
         fw, fh = self.camera.get_frame_size()
+        self.extractor.set_frame_size(fw, fh)
 
         # ── Gesture (ตา/ปาก) ก่อน เพื่อรู้ว่าต้องตรึงเคอร์เซอร์เฟรมนี้หรือไม่ ──
         click_features = self.extractor.extract_click_features(landmarks)
@@ -233,7 +251,10 @@ class Pipeline:
             if swap_eyes:
                 ear_l, ear_r = ear_r, ear_l
             events = self.gesture_detector.update(now, ear_l, ear_r, delta_smile)
-        freeze = self.gesture_detector.freeze_cursor
+        gd = self.gesture_detector
+        self._status["gesture_state"] = gd.state
+        self._status["ratio_l"], self._status["ratio_r"] = gd.ratio_l, gd.ratio_r
+        freeze = gd.freeze_cursor
 
         # ── Cursor ──
         cursor_features = self.extractor.extract_cursor_features(landmarks, fw, fh)
@@ -242,12 +263,17 @@ class Pipeline:
             pos = self.cursor_predictor.predict(cursor_features)
 
         in_scroll = self._status["mode"] == "scroll"
+        if in_scroll:
+            self._update_scroll(now, self.extractor.extract_head_pitch_signal(landmarks))
 
-        if pos is not None:
+        if pos is not None and in_scroll:
+            # โหมด scroll: เคอร์เซอร์อยู่นิ่งที่จุดเข้าโหมด (wheel event ลงหน้าต่างนั้น)
+            self._pos_history.append(pos)
+        elif pos is not None:
             if freeze and self._locked_pos is None:
                 # เพิ่งเริ่มทำท่า → ย้อนกลับไปตำแหน่งก่อนใบหน้าเริ่มเปลี่ยน แล้วล็อกไว้
                 self._locked_pos = self._pos_history[0] if self._pos_history else pos
-                if not in_scroll and not self._paused:
+                if not self._paused:
                     self.mouse_controller.move_to(*self._locked_pos)
             elif not freeze and self._locked_pos is not None:
                 self._locked_pos = None
@@ -257,20 +283,19 @@ class Pipeline:
 
             if self._locked_pos is None:
                 self._pos_history.append(pos)
-                if not in_scroll and not self._paused:
+                if not self._paused:
                     self.mouse_controller.move_to(*pos)
                     self._status["cursor_x"], self._status["cursor_y"] = int(pos[0]), int(pos[1])
             else:
                 self._status["cursor_x"], self._status["cursor_y"] = (int(self._locked_pos[0]),
                                                                       int(self._locked_pos[1]))
 
-            if in_scroll:
-                self._update_scroll(now, pos)
-
         self._status["locked"] = self._locked_pos is not None
 
         # ── Execute events ──
         for ev in events:
+            if self._status["mode"] == "scroll" and ev in _EYE_EVENTS:
+                continue
             self._execute_action(ev, now)
 
     # ──────────────────────────────────────────────
@@ -312,47 +337,102 @@ class Pipeline:
                 self._status["mode"] = "drag"
         elif event == "scroll_toggle":
             if self._status["mode"] == "scroll":
-                self._status["mode"] = "normal"
-                self._status["last_action"] = "Scroll End"
-                mc.is_scrolling = False
-                self._scroll_anchor_y = None
-                self.cursor_predictor.reset_smoothing()
-                self._pos_history.clear()
+                self._exit_scroll_mode("Scroll End")
             else:
                 if mc.is_dragging:
                     mc.mouse_up()
                 self._status["mode"] = "scroll"
                 self._status["last_action"] = "Scroll Mode"
                 mc.is_scrolling = True
-                self._scroll_anchor_y = None   # ตั้งจุดอ้างอิงจากเฟรมถัดไป
-                self._scroll_accum = 0.0
-                self._last_scroll_t = None
+                # wheel event ไปที่หน้าต่างใต้เคอร์เซอร์ → ตรึงเคอร์เซอร์ไว้ตลอดโหมด scroll
+                self._scroll_pos = (x, y) if x is not None else None
+                self._reset_scroll_tracking()
+                self._scroll_active_t = now
         else:
             return
 
         self._status["last_action_time"] = now
 
-    def _update_scroll(self, now, pos):
-        """โหมด scroll: ก้มหน้า = เลื่อนลง, เงยหน้า = เลื่อนขึ้น (ความเร็วตามระยะที่ก้ม/เงย)"""
-        if self._locked_pos is not None or self._paused:
-            self._last_scroll_t = None
+    # ──────────────────────────────────────────────
+    # Scroll mode
+    # ──────────────────────────────────────────────
+    def _reset_scroll_tracking(self):
+        """ล้างจุดอ้างอิง — จะตั้งใหม่หลังสัญญาณนิ่ง settle_s"""
+        self._scroll_anchor = None
+        self._scroll_sig = None
+        self._scroll_settle = []
+        self._scroll_settle_t = None
+        self._scroll_accum = 0.0
+        self._last_scroll_t = None
+        self._scroll_active_t = time.perf_counter()
+        self._status["scroll_offset"] = 0.0
+
+    def _exit_scroll_mode(self, label):
+        self._status["mode"] = "normal"
+        self._status["last_action"] = label
+        self.mouse_controller.is_scrolling = False
+        self._reset_scroll_tracking()
+        # ยังยิ้มค้างอยู่ตอนสลับโหมด → ตรึงเคอร์เซอร์ไว้ที่เดิมจนเลิกยิ้ม ไม่ให้กระโดด
+        if self._scroll_pos is not None:
+            self._locked_pos = self._scroll_pos
+        self._scroll_pos = None
+        self.cursor_predictor.reset_smoothing()
+        self._pos_history.clear()
+
+    def _update_scroll(self, now, pitch):
+        """โหมด scroll: ก้มหน้า = เลื่อนลง, เงยหน้า = เลื่อนขึ้น (ความเร็วตามระยะที่ก้ม/เงย)
+
+        ใช้สัญญาณก้ม/เงยจากใบหน้าโดยตรง (ไม่ผ่านโมเดลเคอร์เซอร์ที่ถูก clamp ที่ขอบจอ)
+        และไม่หยุดเพราะ EAR เปลี่ยน (ก้มหน้าทำให้ตาดูหรี่ลงเป็นปกติ) — หยุดเฉพาะตอนยิ้ม
+        """
+        sp = self.scroll_params
+        if pitch is None:
             return
-        if self._scroll_anchor_y is None:
-            self._scroll_anchor_y = pos[1]
-            self._last_scroll_t = now
+        self._scroll_sig = pitch if self._scroll_sig is None else (
+            self._scroll_sig + sp.smoothing * (pitch - self._scroll_sig))
+        sig = self._scroll_sig
+
+        if self.gesture_detector.smiling or self._paused:
+            # กำลังยิ้ม (สลับโหมด) → ไม่เลื่อน และตั้งจุดอ้างอิงใหม่หลังเลิกยิ้ม
+            self._scroll_anchor = None
+            self._scroll_settle = []
+            self._scroll_settle_t = None
+            self._last_scroll_t = None
+            self._scroll_active_t = now
             return
 
-        dt = now - (self._last_scroll_t or now)
+        if self._scroll_anchor is None:
+            if self._scroll_settle_t is None:
+                self._scroll_settle_t = now
+            self._scroll_settle.append(sig)
+            if now - self._scroll_settle_t >= sp.settle_s:
+                self._scroll_anchor = float(np.median(self._scroll_settle))
+                self._scroll_settle = []
+                self._last_scroll_t = now
+                self._scroll_active_t = now
+            return
+
+        dt = min(now - (self._last_scroll_t or now), 0.1)
         self._last_scroll_t = now
 
-        dy = pos[1] - self._scroll_anchor_y          # + = ก้ม (ตำแหน่งต่ำลงจอ)
-        mag = abs(dy)
-        if mag < _SCROLL_DEADZONE_PX:
+        d = sig - self._scroll_anchor                 # + = ก้ม
+        self._status["scroll_offset"] = d
+        mag = abs(d)
+        if mag < sp.deadzone:
             self._scroll_accum = 0.0
+            # ขณะนิ่ง ค่อยๆ ให้จุดอ้างอิงตามท่านั่งที่เปลี่ยนไป
+            self._scroll_anchor += sp.anchor_follow * d
+            if sp.idle_exit_s > 0 and now - self._scroll_active_t >= sp.idle_exit_s:
+                self._exit_scroll_mode("Scroll End (idle)")
             return
-        speed = min(1.0, (mag - _SCROLL_DEADZONE_PX) / (_SCROLL_FULL_SPEED_PX - _SCROLL_DEADZONE_PX))
-        notches = speed * _SCROLL_MAX_NOTCH_PER_S * dt * (-1.0 if dy > 0 else 1.0)
-        self._scroll_accum += notches
+
+        self._scroll_active_t = now
+        span = max(sp.full_speed - sp.deadzone, 1e-6)
+        speed = min(1.0, (mag - sp.deadzone) / span) ** sp.speed_gamma
+        direction = -1.0 if d > 0 else 1.0           # ก้ม → wheel ลบ = เลื่อนลง
+        if sp.invert:
+            direction = -direction
+        self._scroll_accum += speed * sp.max_notch_per_s * dt * direction
         whole = int(self._scroll_accum)
         if whole != 0:
             self._scroll_accum -= whole

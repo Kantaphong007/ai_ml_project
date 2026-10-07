@@ -36,9 +36,15 @@ class MainWindow(QMainWindow):
       - Control buttons (Start, Calibrate, Train, Keyboard, Settings)
       - Model status indicators
     """
+
+    # pipeline เรียก callback จาก thread ของมันเอง → ส่งผ่าน signal ให้ Qt อัปเดต widget ใน GUI thread
+    _frame_ready = pyqtSignal(object)
+    _status_ready = pyqtSignal(object)
     
     def __init__(self):
         super().__init__()
+        self._frame_ready.connect(self._on_frame)
+        self._status_ready.connect(self._on_status)
         
         self.pipeline = Pipeline()
         self.overlay = OverlayWidget()
@@ -183,7 +189,8 @@ class MainWindow(QMainWindow):
             ("FPS:", "_fps_val"), ("Face:", "_face_val"),
             ("EAR L:", "_ear_l_val"), ("EAR R:", "_ear_r_val"),
             ("ΔSmile:", "_smile_val"), ("Mode:", "_mode_val"),
-            ("Action:", "_action_val"), ("Conf:", "_conf_val"),
+            ("Action:", "_action_val"), ("State:", "_state_val"),
+            ("Ratio:", "_ratio_val"), ("Scroll:", "_scroll_val"),
         ]
         
         for i, (text, attr) in enumerate(labels):
@@ -239,6 +246,18 @@ class MainWindow(QMainWindow):
         self._gesture_btn = QPushButton("✋ Collect Gestures")
         self._gesture_btn.clicked.connect(self._run_gesture_collection)
         ctrl_layout.addWidget(self._gesture_btn)
+
+        # จูนการตรวจจับท่าทาง/scroll ด้วยข้อมูลจริง
+        tune_layout = QHBoxLayout()
+        self._record_signals_btn = QPushButton("🎙 Record Signals")
+        self._record_signals_btn.setToolTip("บันทึกสัญญาณตา/ยิ้ม/ก้มเงย พร้อม label สำหรับจูนค่า")
+        self._record_signals_btn.clicked.connect(self._run_signal_recorder)
+        tune_layout.addWidget(self._record_signals_btn)
+        self._tune_btn = QPushButton("🔧 Tune Gestures")
+        self._tune_btn.setToolTip("ค้นหาค่าที่ดีที่สุดจากข้อมูลที่บันทึก → data/gesture_tuning.json")
+        self._tune_btn.clicked.connect(self._run_tuner)
+        tune_layout.addWidget(self._tune_btn)
+        ctrl_layout.addLayout(tune_layout)
         
         # Training buttons
         train_layout = QHBoxLayout()
@@ -330,8 +349,8 @@ class MainWindow(QMainWindow):
                 )
                 return
             
-            self.pipeline.on_frame_update = self._on_frame
-            self.pipeline.on_status_update = self._on_status
+            self.pipeline.on_frame_update = self._frame_ready.emit
+            self.pipeline.on_status_update = self._status_ready.emit
             self.pipeline.start()
             self._running = True
             self._start_btn.setText("⏸  Stop")
@@ -353,7 +372,8 @@ class MainWindow(QMainWindow):
         """เปิด/ปิดปุ่มขณะ pipeline ทำงาน"""
         for btn in [self._baseline_btn, self._calibrate_btn,
                     self._gesture_btn, self._train_cursor_btn,
-                    self._train_click_btn, self._eval_btn]:
+                    self._train_click_btn, self._eval_btn,
+                    self._record_signals_btn, self._tune_btn]:
             btn.setEnabled(enabled)
     
     def _on_frame(self, frame):
@@ -406,7 +426,9 @@ class MainWindow(QMainWindow):
         self._mode_val.setStyleSheet(f"color: {mode_colors.get(mode, '#aabbdd')};")
         
         self._action_val.setText(status.get("last_action", "—") or "—")
-        self._conf_val.setText(f"{status.get('confidence', 0):.2f}")
+        self._state_val.setText(status.get("gesture_state", "—"))
+        self._ratio_val.setText(f"{status.get('ratio_l', 0):.2f} / {status.get('ratio_r', 0):.2f}")
+        self._scroll_val.setText(f"{status.get('scroll_offset', 0):+.3f}" if mode == "scroll" else "—")
     
     def _run_baseline(self):
         """รัน baseline recording"""
@@ -423,6 +445,16 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage("Running gesture collection...")
         self._run_script("calibration/gesture_collection.py")
     
+    def _run_signal_recorder(self):
+        """บันทึกสัญญาณสำหรับจูนการตรวจจับท่าทาง"""
+        self._statusbar.showMessage("Recording gesture signals...")
+        self._run_script("calibration/signal_recorder.py")
+
+    def _run_tuner(self):
+        """จูนพารามิเตอร์จากข้อมูลที่บันทึก (ผลใช้ตอนกด Start ครั้งถัดไป)"""
+        self._statusbar.showMessage("Tuning gestures — ผลจะใช้เมื่อกด Start ครั้งถัดไป")
+        self._run_script("training/tune_gestures.py")
+
     def _train_cursor(self):
         """เทรน cursor model"""
         self._statusbar.showMessage("Training cursor model...")
@@ -446,11 +478,9 @@ class MainWindow(QMainWindow):
         full_path = os.path.join(project_root, script_path)
         
         try:
-            subprocess.Popen(
-                [sys.executable, full_path],
-                cwd=project_root,
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
+            # Windows: เปิดหน้าต่าง console ใหม่ / macOS, Linux: log ออก terminal ที่เปิดโปรแกรม
+            flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0
+            subprocess.Popen([sys.executable, full_path], cwd=project_root, creationflags=flags)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"ไม่สามารถรัน script:\n{e}")
     

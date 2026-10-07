@@ -96,18 +96,14 @@ class GestureCollector:
         baseline = BaselineRecorder.load_baseline()
         if baseline is not None:
             print(f"  📂 โหลดค่าฐานจาก: {BASELINE_DATA_PATH}")
-            self.extractor.set_baseline_mouth_width(
-                baseline["baseline_mouth_width"]
-            )
+            self.extractor.set_baseline_mouth_ratio(baseline.get("baseline_mouth_ratio"))
             return baseline
         
         print("  ⚠️ ยังไม่มีค่าฐาน จะบันทึกใหม่...")
         recorder = BaselineRecorder()
         baseline = recorder.record()
         if baseline is not None:
-            self.extractor.set_baseline_mouth_width(
-                baseline["baseline_mouth_width"]
-            )
+            self.extractor.set_baseline_mouth_ratio(baseline.get("baseline_mouth_ratio"))
         return baseline
     
     def run(self, reps_per_class=None, classes=None):
@@ -138,6 +134,7 @@ class GestureCollector:
             return None
         
         self.camera.start()
+        self.extractor.set_frame_size(*self.camera.get_frame_size())
         
         # สร้างรายการท่าทางที่ต้องเก็บ (สุ่มลำดับ)
         gesture_queue = []

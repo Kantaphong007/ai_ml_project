@@ -36,7 +36,7 @@ class OverlayWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         
         # ตำแหน่ง: มุมบนขวา
-        self.setGeometry(SCREEN_WIDTH - 280, 10, 260, 180)
+        self.setGeometry(SCREEN_WIDTH - 280, 10, 260, 200)
         
         self._status = {}
         self._build_ui()
@@ -58,6 +58,11 @@ class OverlayWidget(QWidget):
         self._ear_label.setStyleSheet("color: #AACCFF;")
         layout.addWidget(self._ear_label)
         
+        self._state_label = QLabel("State: idle")
+        self._state_label.setFont(font)
+        self._state_label.setStyleSheet("color: #CCCCFF;")
+        layout.addWidget(self._state_label)
+
         self._smile_label = QLabel("ΔSmile: 0.00%")
         self._smile_label.setFont(font)
         self._smile_label.setStyleSheet("color: #FFCC88;")
@@ -101,6 +106,10 @@ class OverlayWidget(QWidget):
         ear_r = status.get("ear_r", 0)
         self._ear_label.setText(f"EAR L: {ear_l:.3f}  R: {ear_r:.3f}")
         
+        self._state_label.setText(
+            f"State: {status.get('gesture_state', '—')}  "
+            f"({status.get('ratio_l', 0):.2f}/{status.get('ratio_r', 0):.2f})")
+
         ds = status.get("delta_smile", 0)
         self._smile_label.setText(f"ΔSmile: {ds*100:.1f}%")
         

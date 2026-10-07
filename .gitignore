@@ -1,0 +1,29 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── Virtual env ──
+.venv/
+venv/
+env/
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── ข้อมูลส่วนตัวของผู้ใช้แต่ละคน (ค่าฐาน/ค่าที่จูน/การตั้งค่า ผูกกับหน้าและกล้องของคนนั้น) ──
+# เอา # ออกถ้าไม่ต้องการ commit ข้อมูลของตัวเอง
+# data/baseline.json
+# data/user_settings.json
+# data/gesture_tuning.json
+# data/gesture_signals.csv
+# data/calibration_data.csv
+# data/gesture_data.csv
+
+# ── โมเดลที่เทรนแล้ว (สร้างใหม่ได้จาก Train) ──
+# models/*.pkl
+models/*_backup.pkl

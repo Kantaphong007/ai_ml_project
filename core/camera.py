@@ -2,6 +2,7 @@
 EYE ORDER COME AI — Camera Stream Manager
 จัดการ OpenCV VideoCapture สำหรับอ่านเฟรมจากกล้องเว็บแคม
 """
+import sys
 import cv2
 import threading
 import time
@@ -58,7 +59,9 @@ class CameraStream:
         Raises:
             RuntimeError: ถ้าเปิดกล้องไม่ได้
         """
-        self._cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        # DirectShow มีเฉพาะ Windows (เปิดกล้องเร็วกว่า) — macOS/Linux ใช้ backend อัตโนมัติ
+        backend = cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY
+        self._cap = cv2.VideoCapture(self.camera_index, backend)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS, self.fps)

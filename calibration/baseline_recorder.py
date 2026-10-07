@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.camera import CameraStream
 from core.face_mesh import FaceMeshDetector
-from core.feature_extractor import FeatureExtractor
+from core.feature_extractor import FeatureExtractor, EAR_VERSION
 from config.settings import (
     CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT, FPS,
     BASELINE_DURATION_SEC, BASELINE_DATA_PATH
@@ -43,9 +43,10 @@ class BaselineRecorder:
         
         Returns:
             dict: {
-                "baseline_mouth_width": float,
+                "baseline_mouth_ratio": float,  # ความกว้างปาก ÷ ระยะหางตา
                 "baseline_ear_l": float,
                 "baseline_ear_r": float,
+                "ear_version": int,
                 "num_frames": int,
             }
         """
@@ -60,6 +61,7 @@ class BaselineRecorder:
         print("\n  กด SPACE เพื่อเริ่มบันทึก...")
         
         self.camera.start()
+        self.extractor.set_frame_size(*self.camera.get_frame_size())
         
         # รอให้ผู้ใช้กด SPACE
         while True:
@@ -107,10 +109,10 @@ class BaselineRecorder:
                     ear_ls.append(click_feat[0])
                     ear_rs.append(click_feat[1])
                 
-                # Mouth width
-                mw = self.extractor.compute_baseline_mouth_width(landmarks)
-                if mw is not None:
-                    mouth_widths.append(mw)
+                # Mouth ratio (ไม่ขึ้นกับระยะห่างจากกล้อง)
+                mr = self.extractor.compute_mouth_ratio(landmarks)
+                if mr is not None:
+                    mouth_widths.append(mr)
                 
                 frame_count += 1
             
@@ -144,11 +146,12 @@ class BaselineRecorder:
             print("  ❌ ไม่สามารถตรวจจับใบหน้าได้ กรุณาลองใหม่")
             return None
         
-        # คำนวณค่าเฉลี่ย
+        # ใช้ median: ถ้าเผลอกะพริบตาระหว่างบันทึก ค่าฐานไม่ถูกดึงลง
         baseline = {
-            "baseline_mouth_width": float(np.mean(mouth_widths)),
-            "baseline_ear_l": float(np.mean(ear_ls)),
-            "baseline_ear_r": float(np.mean(ear_rs)),
+            "baseline_mouth_ratio": float(np.median(mouth_widths)),
+            "baseline_ear_l": float(np.median(ear_ls)),
+            "baseline_ear_r": float(np.median(ear_rs)),
+            "ear_version": EAR_VERSION,
             "num_frames": frame_count,
         }
         
@@ -158,7 +161,7 @@ class BaselineRecorder:
             json.dump(baseline, f, indent=2)
         
         print(f"\n  ✅ บันทึกค่าฐานเสร็จสิ้น ({frame_count} frames)")
-        print(f"     Mouth width: {baseline['baseline_mouth_width']:.6f}")
+        print(f"     Mouth ratio: {baseline['baseline_mouth_ratio']:.4f}")
         print(f"     EAR_L:       {baseline['baseline_ear_l']:.4f}")
         print(f"     EAR_R:       {baseline['baseline_ear_r']:.4f}")
         print(f"     บันทึกไว้ที่: {BASELINE_DATA_PATH}")

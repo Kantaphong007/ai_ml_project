@@ -75,10 +75,12 @@ def run_cli():
         print("  5. 🏋️  เทรนโมเดล Click (Classification)")
         print("  6. 📊 ประเมินผลโมเดล")
         print("  7. ▶  เริ่มควบคุมเมาส์ด้วยสายตา")
+        print("  8. 🎙  บันทึกสัญญาณสำหรับจูนท่าทาง (Record Signals)")
+        print("  9. 🔧 จูนค่าการตรวจจับท่าทาง/scroll (Tune Gestures)")
         print("  0. ❌ ออก")
         print("  ─────────────────────────────────")
         
-        choice = input("  เลือก [0-7]: ").strip()
+        choice = input("  เลือก [0-9]: ").strip()
         
         if choice == "0":
             print("\n  👋 ออกจากโปรแกรม")
@@ -133,8 +135,15 @@ def run_cli():
                     pipe.stop()
             else:
                 print("  ❌ ไม่สามารถเริ่มระบบได้")
+        elif choice == "8":
+            from calibration.signal_recorder import SignalRecorder
+            SignalRecorder().run()
+        elif choice == "9":
+            from training.tune_gestures import main as tune_gestures
+            sys.argv = [sys.argv[0]]
+            tune_gestures()
         else:
-            print("  ⚠️ กรุณาเลือก 0-7")
+            print("  ⚠️ กรุณาเลือก 0-9")
 
 
 def main():
