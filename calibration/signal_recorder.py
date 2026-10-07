@@ -44,8 +44,8 @@ PROTOCOL = {
     "idle":         ("Use the computer normally: move head to all screen corners, blink naturally",
                      "ใช้งานปกติ: หันหัวไปทุกมุมจอ กะพริบตาตามธรรมชาติ (ห้ามทำท่าคลิก)", 20.0, 1),
     "blink":        ("Blink ONCE naturally", "กะพริบตาตามปกติ 1 ครั้ง", 2.0, 8),
-    "wink_left":    ("Wink LEFT eye ~0.5s, then open", "ขยิบตาซ้าย ~0.5 วิ แล้วลืมตา", 2.5, 8),
-    "wink_right":   ("Wink RIGHT eye ~0.5s, then open", "ขยิบตาขวา ~0.5 วิ แล้วลืมตา", 2.5, 8),
+    "wink_left":    ("Wink LEFT eye quickly (~0.2-0.4s)", "ขยิบตาซ้ายสั้นๆ ~0.2–0.4 วิ แล้วลืมตา", 2.5, 8),
+    "wink_right":   ("Wink RIGHT eye quickly (~0.2-0.4s)", "ขยิบตาขวาสั้นๆ ~0.2–0.4 วิ แล้วลืมตา", 2.5, 8),
     "double_blink": ("Blink firmly TWICE quickly", "กะพริบตาแน่นๆ 2 ครั้งติดกัน", 2.5, 8),
     "drag":         ("Close ONE eye and hold ~1.5s, then open", "หลับตาข้างเดียวค้าง ~1.5 วิ แล้วลืมตา", 3.2, 5),
     "smile":        ("Smile wide, hold ~1s, then relax", "ยิ้มกว้างค้าง ~1 วิ แล้วหยุดยิ้ม", 3.0, 6),
@@ -74,7 +74,8 @@ class SignalRecorder:
             with open(BASELINE_DATA_PATH, "r") as f:
                 b = json.load(f)
             if b.get("ear_version") == EAR_VERSION:
-                self.extractor.set_baseline_mouth_ratio(b.get("baseline_mouth_ratio"))
+                self.extractor.set_baseline_mouth_ratio(b.get("baseline_mouth_ratio"),
+                                                        b.get("baseline_pitch"))
                 return
         print("  ⚠️ ไม่มีค่าฐานเวอร์ชันปัจจุบัน — ค่าปากจะเรียนจากกล้องเอง (แนะนำกด Baseline ก่อน)")
 

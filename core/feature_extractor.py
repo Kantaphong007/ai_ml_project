@@ -10,15 +10,11 @@ EAR / ความกว้างปาก คำนวณในพิกัด 
   - ระยะ 3 มิติแทบไม่เปลี่ยนเมื่อก้ม/เงย/หันหน้า → EAR นิ่งขึ้นตอนคุมเคอร์เซอร์ด้วยศีรษะ
 ΔSmile เทียบความกว้างปากกับระยะหางตาซ้าย–ขวา → ไม่เพี้ยนเมื่อนั่งใกล้/ไกลกล้อง
 """
-from collections import deque
 
 import numpy as np
 from core.face_mesh import FaceMeshDetector
-from utils.math_utils import (
-    calculate_ear_multi,
-    calculate_mouth_width,
-    solve_head_pose,
-)
+from core.smile import SmileEstimator
+from utils.math_utils import calculate_ear_multi, calculate_mouth_width
 
 # ตา: (หัวตา/หางตา, คู่เปลือกตาบน-ล่าง 3 คู่) — ใช้ 3 คู่แทน 2 ลด noise ของ EAR
 _LEFT_EYE_CORNERS = (33, 133)
@@ -30,6 +26,15 @@ _FOREHEAD, _CHIN, _NOSE_TIP = 10, 152, 1
 
 # EAR version ที่บันทึกใน baseline.json (ค่า EAR เวอร์ชันเก่าคนละสเกล ห้ามปนกัน)
 EAR_VERSION = 2
+
+# ฟีเจอร์ของโมเดลเคอร์เซอร์ (ลำดับคงที่ — ไฟล์ calibration / โมเดลอ้างอิงตามชื่อ)
+# v5: มุมศีรษะจาก facial transformation matrix (เดิม solvePnP 6 จุด ใช้ไม่ได้)
+CURSOR_FEATURE_VERSION = 5
+CURSOR_FEATURE_NAMES = [
+    "head_yaw", "head_pitch", "head_roll",
+    "nose_offset_x", "nose_offset_y",
+    "nose_x", "nose_y",
+]
 
 
 class FeatureExtractor:
@@ -53,10 +58,6 @@ class FeatureExtractor:
     """
     
     FEATURE_SMOOTH_FRAMES = 3
-    # ค่าฐานปากปรับตัวช้าๆ: median ของ ~10 วินาทีล่าสุดที่ "ไม่ได้ยิ้ม"
-    MOUTH_ADAPT_FRAMES = 300
-    MOUTH_LEARN_MIN = 15
-    MOUTH_ADAPT_MAX_DELTA = 0.10
 
     def __init__(self, face_mesh_detector: FaceMeshDetector, frame_size=(640, 480)):
         """
@@ -66,8 +67,8 @@ class FeatureExtractor:
         """
         self.detector = face_mesh_detector
         self.frame_w, self.frame_h = frame_size
-        self.baseline_mouth_ratio = None  # ความกว้างปาก ÷ ระยะหางตา ตอนหน้าปกติ
-        self._mouth_buf = deque(maxlen=self.MOUTH_ADAPT_FRAMES)
+        # ΔSmile ชดเชยการก้ม/เงย + ค่าฐานปรับตัวช้าๆ (ดู core/smile.py)
+        self.smile = SmileEstimator()
         self._cursor_history = []         # Feature history buffer ป้องกันการแกว่ง
 
     def set_frame_size(self, w, h):
@@ -78,68 +79,50 @@ class FeatureExtractor:
         """ล้าง history ของฟีเจอร์เคอร์เซอร์ (เรียกเมื่อหน้าหายไปนาน/เริ่มใหม่)"""
         self._cursor_history = []
 
-    def set_baseline_mouth_ratio(self, ratio):
-        """ตั้งค่าฐาน (ความกว้างปาก ÷ ระยะหางตา) จากหน้าปกติ — None = ให้เรียนเองจากกล้อง"""
-        self.baseline_mouth_ratio = float(ratio) if ratio else None
-        self._mouth_buf.clear()
+    def set_baseline_mouth_ratio(self, ratio, pitch=None):
+        """ตั้งค่าฐาน (ความกว้างปาก ÷ ระยะหางตา, สัญญาณก้มเงย) จากหน้าปกติ — None = เรียนเองจากกล้อง"""
+        self.smile.set_baseline(ratio, pitch)
+
+    def set_smile_pitch_comp(self, k):
+        """ค่าชดเชยการก้ม/เงยของ ΔSmile (จูนจากข้อมูลโดย training/tune_gestures.py)"""
+        self.smile.pitch_comp = float(k)
 
     def _px(self, landmarks, idx):
         x, y, z = landmarks[idx][:3]
         return (x * self.frame_w, y * self.frame_h, z * self.frame_w)
     
-    def extract_cursor_features(self, landmarks, frame_width, frame_height):
-        """สกัดฟีเจอร์ 7 ตัวสำหรับ Nose Tip / Head Motion Cursor Regression
-        
-        Features:
-          [nose_x, nose_y, pitch, yaw, roll, nose_offset_x, nose_offset_y]
+    def extract_cursor_features(self, landmarks, frame_width=None, frame_height=None):
+        """สกัดฟีเจอร์ 7 ตัวสำหรับ Cursor Regression (ลำดับตาม CURSOR_FEATURE_NAMES)
+
+        [head_yaw, head_pitch, head_roll, nose_offset_x, nose_offset_y, nose_x, nose_y]
+          head_*      : มุมศีรษะจาก facial transformation matrix ของ MediaPipe (องศา)
+          nose_offset : ปลายจมูกเทียบกึ่งกลางกรอบหน้า (การหมุนหัวล้วน ไม่ขึ้นกับท่านั่ง)
+          nose_x/y    : ตำแหน่งปลายจมูกในภาพ (เปลี่ยนตามท่านั่ง — ให้ feature selection ตัดสิน)
         """
-        if landmarks is None:
+        if landmarks is None or self.detector.head_pose is None:
             return None
-        
         try:
-            # ── 1. Nose Tip 2D coordinates ──
-            nose_tip = self.detector.get_nose_tip(landmarks)
-            nose_x, nose_y = float(nose_tip[0]), float(nose_tip[1])
-            
-            # ── 2. Head pose angles ──
-            head_pose_pts = self.detector.get_head_pose_points(landmarks)
-            pitch, yaw, roll = solve_head_pose(
-                head_pose_pts, frame_width, frame_height
-            )
-            
-            # ── 3. Relative Nose Offset from Pure Face Outline Center (อิสระจากสายตา 100%) ──
-            # โหนกแก้มซ้าย (#234) & ขวา (#454), หน้าผาก (#10) & คาง (#152)
-            left_cheek = landmarks[234]
-            right_cheek = landmarks[454]
-            forehead = landmarks[10]
-            chin = landmarks[152]
-            
-            face_center_x = (left_cheek[0] + right_cheek[0]) / 2.0
-            face_center_y = (forehead[1] + chin[1]) / 2.0
-            
-            nose_offset_x = nose_x - face_center_x
-            nose_offset_y = nose_y - face_center_y
-            
+            yaw, pitch, roll = self.detector.head_pose
+            nose = landmarks[self.detector.NOSE_TIP]
+            # กึ่งกลางกรอบหน้า: โหนกแก้มซ้าย (#234) / ขวา (#454), หน้าผาก (#10) / คาง (#152)
+            face_cx = (landmarks[234][0] + landmarks[454][0]) / 2.0
+            face_cy = (landmarks[10][1] + landmarks[152][1]) / 2.0
             raw_feat = np.array([
-                nose_x, nose_y,
-                pitch, yaw, roll,
-                nose_offset_x, nose_offset_y
+                yaw, pitch, roll,
+                nose[0] - face_cx, nose[1] - face_cy,
+                nose[0], nose[1],
             ], dtype=np.float64)
-            
-            # กรองเบาๆ ด้วย weighted moving average 3 เฟรม (หน่วงน้อยกว่า 1 เฟรม)
-            # การกรองหลักทำที่ One-Euro filter ใน CursorPredictor เพียงชั้นเดียว
-            # (เดิมกรองซ้อนหลายชั้นจนเคอร์เซอร์หน่วงและคุมยาก)
+
+            # weighted moving average 3 เฟรม (หน่วงน้อยกว่า 1 เฟรม) — กรองหลักอยู่ชั้นถัดไป
             self._cursor_history.append(raw_feat)
             if len(self._cursor_history) > self.FEATURE_SMOOTH_FRAMES:
                 self._cursor_history = self._cursor_history[-self.FEATURE_SMOOTH_FRAMES:]
-
             weights = np.arange(1, len(self._cursor_history) + 1, dtype=np.float64)
             weights /= weights.sum()
             return np.average(self._cursor_history, axis=0, weights=weights)
-
         except Exception:
             return None
-    
+
     def _ear(self, landmarks, corners, lids):
         px = lambda i: self._px(landmarks, i)
         return calculate_ear_multi(px(corners[0]), px(corners[1]),
@@ -157,16 +140,6 @@ class FeatureExtractor:
             return mouth / eyes if eyes > 0 else None
         except Exception:
             return None
-
-    def _delta_smile(self, ratio):
-        """ΔSmile เทียบค่าฐาน พร้อมปรับค่าฐานช้าๆ จากช่วงที่ไม่ได้ยิ้ม"""
-        ref = self.baseline_mouth_ratio
-        delta = 0.0 if not ref else ratio / ref - 1.0
-        if not ref or delta < self.MOUTH_ADAPT_MAX_DELTA:
-            self._mouth_buf.append(ratio)
-            if len(self._mouth_buf) >= self.MOUTH_LEARN_MIN:
-                self.baseline_mouth_ratio = float(np.median(self._mouth_buf))
-        return delta
 
     def extract_click_features(self, landmarks):
         """สกัดฟีเจอร์ 3 ตัวสำหรับ Click Classification (1 เฟรม)
@@ -186,7 +159,8 @@ class FeatureExtractor:
             ear_r = self._ear(landmarks, _RIGHT_EYE_CORNERS, _RIGHT_EYE_LIDS)
 
             ratio = self.compute_mouth_ratio(landmarks)
-            delta_smile = self._delta_smile(ratio) if ratio else 0.0
+            pitch = self.extract_head_pitch_signal(landmarks)
+            delta_smile = self.smile.update(ratio, pitch) if ratio else 0.0
 
             return np.array([ear_l, ear_r, delta_smile], dtype=np.float64)
             
@@ -234,12 +208,8 @@ class FeatureExtractor:
     
     @staticmethod
     def get_cursor_feature_names():
-        """ชื่อ columns สำหรับ cursor features (Nose Tip & Head Pose)"""
-        return [
-            "nose_x", "nose_y",
-            "pitch", "yaw", "roll",
-            "nose_offset_x", "nose_offset_y"
-        ]
+        """ชื่อ columns สำหรับ cursor features"""
+        return list(CURSOR_FEATURE_NAMES)
     
     @staticmethod
     def get_click_feature_names():

@@ -3,7 +3,7 @@ EYE ORDER COME AI — 9-Point Calibration
 ระบบ Calibration สำหรับเก็บข้อมูลความสัมพันธ์ระหว่าง
 ตำแหน่งปลายจมูก/การหันหัว → พิกัดหน้าจอ (Regression Dataset)
 
-แสดงจุดเป้าหมาย 9 จุดทีละจุด:
+แสดงจุดเป้าหมาย 13 จุดทีละจุด (9 จุดหลัก + 4 จุดภายในแต่ละควอดรันต์):
   - มุมจอ 4 จุด
   - กึ่งกลางขอบจอ 4 จุด
   - จุดกึ่งกลางจอ 1 จุด
@@ -40,7 +40,7 @@ class NinePointCalibration:
         2. แสดงจุดเป้าหมายสีแดงทีละจุด (สุ่มลำดับ)
         3. ผู้ใช้จ้องมองจุด
         4. หน่วง 0.5 วินาที → บันทึก 1.5 วินาที
-        5. ทำซ้ำจนครบ 9 จุด
+        5. ทำซ้ำจนครบทุกจุด
         6. บันทึก CSV
     """
     
@@ -61,14 +61,14 @@ class NinePointCalibration:
         """เริ่ม calibration
         
         Args:
-            num_rounds: จำนวนรอบ (ทำซ้ำ 9 จุด กี่รอบ)
+            num_rounds: จำนวนรอบ (ทำซ้ำทุกจุด กี่รอบ)
             show_camera: แสดง camera preview ข้างๆ หรือไม่
         
         Returns:
             pd.DataFrame: ข้อมูลที่เก็บได้ หรือ None ถ้ายกเลิก
         """
         print("=" * 60)
-        print("   9-POINT CALIBRATION")
+        print("   CURSOR CALIBRATION")
         print(f"   หน้าจอ: {SCREEN_WIDTH} x {SCREEN_HEIGHT}")
         print(f"   จำนวนจุด: {len(self.target_points)} จุด × {num_rounds} รอบ")
         print("=" * 60)
@@ -97,7 +97,7 @@ class NinePointCalibration:
             for point_num, point_idx in enumerate(point_order):
                 target_x, target_y = self.target_points[point_idx]
                 
-                print(f"  จุดที่ {point_num + 1}/9: ({target_x}, {target_y})")
+                print(f"  จุดที่ {point_num + 1}/{len(point_order)}: ({target_x}, {target_y})")
                 
                 # ── Phase 1: แสดงจุด + countdown ──
                 phase1_start = time.time()
@@ -122,7 +122,7 @@ class NinePointCalibration:
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     cv2.putText(canvas,
                                f"Round {round_idx+1}/{num_rounds}  |  "
-                               f"Point {point_num+1}/9",
+                               f"Point {point_num+1}/{len(point_order)}",
                                (SCREEN_WIDTH // 2 - 150, 40),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 1)
                     
@@ -199,17 +199,21 @@ class NinePointCalibration:
         if os.path.exists(CALIBRATION_DATA_PATH):
             try:
                 existing_df = pd.read_csv(CALIBRATION_DATA_PATH)
-                df = pd.concat([existing_df, df], ignore_index=True)
-                print(f"     📎 สะสมต่อท้ายข้อมูลเดิม (รวมทั้งหมด {len(df)} ตัวอย่าง)")
+                if list(existing_df.columns) == columns:
+                    df = pd.concat([existing_df, df], ignore_index=True)
+                    print(f"     📎 สะสมต่อท้ายข้อมูลเดิม (รวมทั้งหมด {len(df)} ตัวอย่าง)")
+                else:
+                    # ข้อมูลฟีเจอร์รุ่นเก่า (ก่อนใช้ head pose matrix) ใช้ร่วมกันไม่ได้ → เริ่มไฟล์ใหม่
+                    print("     ♻️ ข้อมูลเดิมเป็นฟีเจอร์รุ่นเก่า — เริ่มไฟล์ใหม่")
             except Exception:
                 pass
         
         df.to_csv(CALIBRATION_DATA_PATH, index=False)
         
-        print(f"\n  ✅ บันทึกข้อมูล Calibration เรียบร้อยแล้ว!")
+        print("\n  ✅ บันทึกข้อมูล Calibration เรียบร้อยแล้ว!")
         print(f"     ข้อมูลทั้งหมดในระบบ: {len(df)} ตัวอย่าง")
         print(f"     บันทึกไว้ที่: {CALIBRATION_DATA_PATH}")
-        print(f"\n  สถิติ:")
+        print("\n  สถิติ:")
         print(df.describe().to_string())
         print("\n  💡 คุณสามารถกดปุ่ม '🏋️ Train Cursor' บนหน้าจอหลักเพื่อเทรนโมเดลด้วยตัวเองได้เลยครับ")
         

@@ -1,8 +1,19 @@
 """
-EYE ORDER COME AI — MediaPipe Face Mesh Wrapper
-ตรวจจับใบหน้าและสกัด 478 landmarks + iris landmarks
+EYE ORDER COME AI — Face Landmarker (MediaPipe Tasks)
+ตรวจจับใบหน้า → 478 landmarks + "ท่าศีรษะ" (yaw / pitch / roll) จาก facial transformation matrix
+
+ทำไมใช้ transformation matrix แทน solvePnP 6 จุดแบบเดิม:
+  MediaPipe fit โมเดลใบหน้า 3 มิติทั้งหน้า (468 จุด) เข้ากับภาพ → มุมศีรษะนิ่งกว่ามาก
+  solvePnP เดิมใช้แค่ 6 จุด + โมเดลหน้าทั่วไป ค่า pitch กระโดด 88°–174° จนใช้ไม่ได้
+
+ทิศของมุม (ตรวจกับภาพจริงแล้ว — กลับภาพซ้ายขวาแล้ว yaw กลับเครื่องหมาย ตรงกับตำแหน่งปลายจมูก):
+  head_yaw   + = จมูกชี้ไปทางขวาของภาพ   (mirror เปิด = ผู้ใช้หันขวา → เคอร์เซอร์ไปขวา)
+  head_pitch + = จมูกชี้ลงล่างของภาพ      (ก้มหน้า → เคอร์เซอร์ลง)
+  head_roll  + = เอียงศีรษะตามเข็มนาฬิกาในภาพ
 """
+import math
 import os
+import time
 import warnings
 
 # ปิดข้อความเตือนที่ไม่เกี่ยวกับการทำงาน (protobuf deprecation / log ของ MediaPipe-TFLite)
@@ -12,174 +23,101 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import mediapipe as mp
 import numpy as np
+from mediapipe.tasks.python import BaseOptions, vision
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_PATH = os.path.join(_PROJECT_ROOT, "models", "face_landmarker.task")
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+             "face_landmarker/float16/1/face_landmarker.task")
+
+
+def ensure_model(path=MODEL_PATH):
+    """ดาวน์โหลดโมเดล face_landmarker.task (~4 MB) ถ้ายังไม่มี"""
+    if not os.path.exists(path):
+        import urllib.request
+        print(f"  ⬇️ ดาวน์โหลดโมเดล Face Landmarker → {path}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        urllib.request.urlretrieve(MODEL_URL, path)
+    return path
+
+
+def pose_from_matrix(matrix):
+    """4×4 facial transformation matrix → (yaw, pitch, roll) องศา ตามทิศที่อธิบายไว้ด้านบน
+
+    พิกัดของ matrix: แกน y ชี้ขึ้น, z ชี้เข้าหากล้อง (OpenGL) — แกน z ของโมเดลหน้า = ทิศที่จมูกชี้
+    """
+    R = np.asarray(matrix, dtype=np.float64)[:3, :3]
+    fx, fy, fz = R[:, 2]          # ทิศที่ใบหน้าหันไป
+    ux, uy, _ = R[:, 1]           # ทิศ "ขึ้น" ของใบหน้า
+    yaw = math.degrees(math.atan2(fx, fz))
+    pitch = math.degrees(math.atan2(-fy, math.hypot(fx, fz)))
+    roll = math.degrees(math.atan2(ux, uy))
+    return yaw, pitch, roll
 
 
 class FaceMeshDetector:
-    """Wrapper สำหรับ MediaPipe Face Mesh
-    
-    ตรวจจับใบหน้าและ return พิกัด 478 จุด (+ 10 iris landmarks)
-    พร้อมฟังก์ชันช่วยดึง landmarks เฉพาะส่วน
-    
+    """ตรวจจับใบหน้าทีละเฟรม (โหมดวิดีโอ: ใช้ผลเฟรมก่อนช่วย tracking → นิ่งและเร็วกว่าโหมดภาพ)
+
     Example:
         >>> detector = FaceMeshDetector()
-        >>> rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         >>> landmarks = detector.detect(rgb_frame)
         >>> if landmarks is not None:
-        ...     left_eye = detector.get_left_eye(landmarks)
+        ...     yaw, pitch, roll = detector.head_pose
     """
-    
-    def __init__(self, max_faces=1, refine_landmarks=True,
-                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
-        """
-        Args:
-            max_faces: จำนวนใบหน้าสูงสุดที่ตรวจจับ
-            refine_landmarks: ถ้า True จะตรวจจับ iris ด้วย (478+10 จุด)
-            min_detection_confidence: confidence threshold สำหรับ detection
-            min_tracking_confidence: confidence threshold สำหรับ tracking
-        """
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=max_faces,
-            refine_landmarks=refine_landmarks,
-            min_detection_confidence=min_detection_confidence,
+
+    # มุมปาก (ใช้คำนวณ ΔSmile)
+    MOUTH_LEFT = 61
+    MOUTH_RIGHT = 291
+    NOSE_TIP = 1
+
+    def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        options = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=ensure_model()),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=min_detection_confidence,
+            min_face_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
+            output_facial_transformation_matrixes=True,
         )
-        
-        # Landmark indices
-        # Left eye: p1(inner corner), p2(upper-left), p3(upper-right),
-        #           p4(outer corner), p5(lower-right), p6(lower-left)
-        self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-        
-        # Iris center
-        self.LEFT_IRIS_CENTER = 468
-        self.RIGHT_IRIS_CENTER = 473
-        
-        # Left iris ring
-        self.LEFT_IRIS = [468, 469, 470, 471, 472]
-        self.RIGHT_IRIS = [473, 474, 475, 476, 477]
-        
-        # Mouth corners
-        self.MOUTH_LEFT = 61
-        self.MOUTH_RIGHT = 291
-        
-        # Head pose reference points (6 จุด)
-        # nose tip, chin, left eye inner, right eye inner, left mouth, right mouth
-        self.HEAD_POSE_POINTS = [1, 152, 33, 263, 61, 291]
-        
-        # Upper/Lower lid midpoints สำหรับ iris Y ratio
-        self.LEFT_UPPER_LID = 159   # กลางเปลือกตาบนซ้าย
-        self.LEFT_LOWER_LID = 145   # กลางเปลือกตาล่างซ้าย
-        self.RIGHT_UPPER_LID = 386  # กลางเปลือกตาบนขวา
-        self.RIGHT_LOWER_LID = 374  # กลางเปลือกตาล่างขวา
-    
+        self._landmarker = vision.FaceLandmarker.create_from_options(options)
+        self._last_ts = -1
+        self.head_pose = None     # (yaw, pitch, roll) ของเฟรมล่าสุด หรือ None
+
     def detect(self, rgb_frame):
-        """ตรวจจับใบหน้าและ return landmarks
-        
+        """ตรวจจับใบหน้า
+
         Args:
             rgb_frame: ภาพ RGB (np.ndarray)
-        
+
         Returns:
-            list หรือ None: list ของ (x, y, z) สำหรับทุก landmark
-                           x, y อยู่ในช่วง [0, 1] (normalized)
-                           z เป็นความลึกสัมพัทธ์
-                           None ถ้าไม่พบใบหน้า
+            list ของ (x, y, z) 478 จุด (x, y ∈ [0, 1]) หรือ None ถ้าไม่พบใบหน้า
+            ท่าศีรษะของเฟรมนี้อยู่ใน self.head_pose
         """
-        results = self.face_mesh.process(rgb_frame)
-        
-        if results.multi_face_landmarks and len(results.multi_face_landmarks) > 0:
-            face = results.multi_face_landmarks[0]
-            landmarks = [
-                (lm.x, lm.y, lm.z) for lm in face.landmark
-            ]
-            return landmarks
-        
-        return None
-    
-    def get_landmarks_by_indices(self, landmarks, indices):
-        """ดึง landmarks ตาม indices ที่ต้องการ
-        
-        Args:
-            landmarks: list ของ (x, y, z) ทั้งหมด
-            indices: list ของ index ที่ต้องการ
-        
-        Returns:
-            list: [(x, y, z), ...] ของ landmarks ที่ต้องการ
-        """
-        return [landmarks[i] for i in indices]
-    
-    def get_left_eye(self, landmarks):
-        """ดึง 6 จุดของตาซ้าย"""
-        return self.get_landmarks_by_indices(landmarks, self.LEFT_EYE)
-    
-    def get_right_eye(self, landmarks):
-        """ดึง 6 จุดของตาขวา"""
-        return self.get_landmarks_by_indices(landmarks, self.RIGHT_EYE)
-    
-    def get_left_iris_center(self, landmarks):
-        """ดึงจุดศูนย์กลาง iris ซ้าย"""
-        return landmarks[self.LEFT_IRIS_CENTER]
-    
-    def get_right_iris_center(self, landmarks):
-        """ดึงจุดศูนย์กลาง iris ขวา"""
-        return landmarks[self.RIGHT_IRIS_CENTER]
-    
-    def get_mouth_corners(self, landmarks):
-        """ดึงมุมปากซ้าย-ขวา
-        
-        Returns:
-            tuple: (left_corner, right_corner) ใน (x, y, z)
-        """
-        return landmarks[self.MOUTH_LEFT], landmarks[self.MOUTH_RIGHT]
-    
-    def get_head_pose_points(self, landmarks):
-        """ดึง 6 จุดสำหรับ Head Pose estimation"""
-        return self.get_landmarks_by_indices(landmarks, self.HEAD_POSE_POINTS)
-    
-    def get_nose_tip(self, landmarks):
-        """ดึงพิกัด (x, y, z) ของปลายจมูก (Landmark 1)"""
-        return landmarks[1]
-    
-    def get_iris_ratio_points(self, landmarks, side="left"):
-        """ดึงจุดที่จำเป็นสำหรับคำนวณ iris ratio
-        
-        Args:
-            landmarks: all landmarks
-            side: "left" หรือ "right"
-        
-        Returns:
-            dict: {
-                "iris_center": (x,y,z),
-                "inner_corner": (x,y,z),
-                "outer_corner": (x,y,z),
-                "upper_lid": (x,y,z),
-                "lower_lid": (x,y,z),
-            }
-        """
-        if side == "left":
-            return {
-                "iris_center": landmarks[self.LEFT_IRIS_CENTER],
-                "inner_corner": landmarks[self.LEFT_EYE[0]],  # 33
-                "outer_corner": landmarks[self.LEFT_EYE[3]],  # 133
-                "upper_lid": landmarks[self.LEFT_UPPER_LID],
-                "lower_lid": landmarks[self.LEFT_LOWER_LID],
-            }
+        # โหมดวิดีโอต้องการ timestamp ที่เพิ่มขึ้นเสมอ
+        ts = max(int(time.perf_counter() * 1000), self._last_ts + 1)
+        self._last_ts = ts
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb_frame))
+        result = self._landmarker.detect_for_video(image, ts)
+
+        if not result.face_landmarks:
+            self.head_pose = None
+            return None
+        if result.facial_transformation_matrixes:
+            self.head_pose = pose_from_matrix(result.facial_transformation_matrixes[0])
         else:
-            return {
-                "iris_center": landmarks[self.RIGHT_IRIS_CENTER],
-                "inner_corner": landmarks[self.RIGHT_EYE[0]],  # 362
-                "outer_corner": landmarks[self.RIGHT_EYE[3]],  # 263
-                "upper_lid": landmarks[self.RIGHT_UPPER_LID],
-                "lower_lid": landmarks[self.RIGHT_LOWER_LID],
-            }
-    
+            self.head_pose = None
+        return [(lm.x, lm.y, lm.z) for lm in result.face_landmarks[0]]
+
+    def get_mouth_corners(self, landmarks):
+        return landmarks[self.MOUTH_LEFT], landmarks[self.MOUTH_RIGHT]
+
     def close(self):
-        """ปิด Face Mesh"""
-        self.face_mesh.close()
-    
+        self._landmarker.close()
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False

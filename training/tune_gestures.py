@@ -8,6 +8,9 @@ EYE ORDER COME AI — Tune Gestures (จูนค่าการตรวจจ�
   4. คำนวณ deadzone / ความเร็วเต็มของโหมด scroll จากท่าก้ม/เงย และ noise ตอนนั่งนิ่ง
   5. บันทึก data/gesture_tuning.json → Pipeline โหลดอัตโนมัติตอนกด Start
 
+ใช้ก่อน train_click_model.py: ค่าที่จูน (close/open ratio ฯลฯ) กำหนดว่า episode ถูกตัดตรงไหน
+ซึ่งโมเดล ML ใช้เป็น input — จูนใหม่เมื่อไหร่ควรเทรนโมเดล click ใหม่ด้วย
+
 Usage:
     python training/tune_gestures.py                # จูนและบันทึก
     python training/tune_gestures.py --dry-run      # ดูผลอย่างเดียว ไม่บันทึก
@@ -18,7 +21,7 @@ import os
 import random
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import fields, replace
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -29,19 +32,11 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.tuning import GestureParams, ScrollParams, load_tuning, save_tuning, TUNING_PATH
-from core.gesture_detector import GestureDetector
+from config.tuning import GestureParams, load_tuning, save_tuning
+from training.signal_data import (
+    EXPECTED, GRACE_S, SIGNALS_PATH, Session, estimate_smile_pitch_comp, evaluate, load_sessions,
+)
 
-SIGNALS_PATH = os.path.join(os.path.dirname(TUNING_PATH), "gesture_signals.csv")
-
-# ท่าที่สั่ง → event ที่ควรได้ (None = ต้องไม่มี event)
-EXPECTED = {
-    "blink": None, "nod_down": None, "nod_up": None,
-    "wink_left": "left_click", "wink_right": "right_click",
-    "double_blink": "double_click", "drag": "drag_toggle", "smile": "scroll_toggle",
-}
-GRACE_S = 0.6        # event หลังหมดหน้าต่าง GO ไม่เกินนี้ยังนับเป็นของท่านั้น (ลืมตา/เลิกยิ้มช้า)
-FP_WEIGHT = 0.05     # หักคะแนน 0.05 ต่อการสั่งงานผิด 1 ครั้ง/นาที ตอนไม่ได้ทำท่า
 REG_WEIGHT = 0.01    # ค่าที่ได้คะแนนเท่ากัน เลือกตัวที่ใกล้ default (กัน overfit)
 
 # ช่วงค้นหา (open_ratio = close_ratio + open_gap)
@@ -51,7 +46,10 @@ SEARCH_SPACE = {
     "wink_asym": (0.10, 0.40),
     "wink_side_frac": (0.40, 0.85),
     "blink_depth": (0.30, 0.85),
-    "wink_min_s": (0.12, 0.40),
+    "wink_min_s": (0.10, 0.25),          # ผู้ใช้ต้องการขยิบสั้น — ไม่ค้นหาค่าที่ยาวกว่านี้
+    "clear_wink_min_s": (0.07, 0.12),
+    "clear_wink_other": (0.55, 0.80),
+    "quick_wink_max_s": (0.20, 0.50),
     "wink_max_s": (0.70, 1.15),
     "drag_hold_s": (1.00, 1.40),
     "blink_max_s": (0.25, 0.60),
@@ -60,82 +58,6 @@ SEARCH_SPACE = {
     "smile_hold_s": (0.30, 0.80),
     "open_confirm_s": (0.00, 0.12),
 }
-
-
-# ──────────────────────────────────────────────
-# Data
-# ──────────────────────────────────────────────
-class Session:
-    def __init__(self, sid, g):
-        g = g.sort_values("t")
-        self.sid = sid
-        self.df = g
-        self.frames = list(g[["t", "ear_l", "ear_r", "delta_smile"]].itertuples(index=False, name=None))
-        go = g[g.phase == "go"].groupby("trial").agg(label=("label", "first"), t0=("t", "min"), t1=("t", "max"))
-        self.trials = [(int(i), r.label, r.t0, r.t1) for i, r in go.iterrows()]
-        gap = g[g.phase == "gap"]
-        self.gap_s = float(gap.groupby("trial").t.agg(lambda s: s.max() - s.min()).sum())
-        self.idle = [(t0, t1) for _, lb, t0, t1 in self.trials if lb == "idle"]
-        quiet = gap if len(gap) > 10 else g
-        self.ref_l = float(quiet.ear_l.quantile(0.6))
-        self.ref_r = float(quiet.ear_r.quantile(0.6))
-
-
-def load_sessions(path):
-    if not os.path.exists(path):
-        print(f"  ❌ ไม่พบ {path}\n     รัน python calibration/signal_recorder.py ก่อน")
-        return []
-    df = pd.read_csv(path)
-    return [Session(sid, g) for sid, g in df.groupby("session", sort=False)]
-
-
-# ──────────────────────────────────────────────
-# Replay + scoring
-# ──────────────────────────────────────────────
-def replay(sess, gp):
-    det = GestureDetector(sess.ref_l, sess.ref_r, params=gp)
-    events, prev = [], None
-    for t, el, er, ds in sess.frames:
-        if prev is not None and t - prev > 0.5:      # หน้าหาย → เหมือน pipeline
-            det.reset()
-        prev = t
-        for e in det.update(t, el, er, ds):
-            events.append((t, e))
-    return events
-
-
-def evaluate(sessions, gp):
-    """คืน dict: score, balanced accuracy, fp/min, accuracy ต่อท่า, confusion"""
-    per_label = defaultdict(lambda: [0, 0])
-    confusion = defaultdict(Counter)
-    fp, quiet_s = 0, 0.0
-    for s in sessions:
-        events = replay(s, gp)
-        used = [False] * len(events)
-        for _, label, t0, t1 in s.trials:
-            got = []
-            for i, (t, e) in enumerate(events):
-                if not used[i] and t0 <= t <= t1 + GRACE_S:
-                    used[i] = True
-                    got.append(e)
-            if label == "idle":
-                fp += len(got)
-                quiet_s += t1 - t0
-                continue
-            if label not in EXPECTED:
-                continue
-            exp = EXPECTED[label]
-            ok = (not got) if exp is None else (got == [exp])
-            per_label[label][0] += ok
-            per_label[label][1] += 1
-            confusion[label]["none" if not got else "+".join(got)] += 1
-        fp += used.count(False)
-        quiet_s += s.gap_s
-    acc = {k: c / n for k, (c, n) in per_label.items() if n}
-    bal = float(np.mean(list(acc.values()))) if acc else 0.0
-    fpm = fp / max(quiet_s / 60.0, 1e-6)
-    return {"score": bal - FP_WEIGHT * fpm, "balanced_acc": bal, "fp_per_min": fpm,
-            "acc": acc, "confusion": confusion}
 
 
 # ──────────────────────────────────────────────
@@ -312,17 +234,24 @@ def main():
     if few:
         print(f"  ⚠️ ข้อมูลน้อย (<5 ครั้ง): {few} — ผลจูนอาจไม่นิ่ง ควรอัดเพิ่ม")
 
-    signal_summary(sessions)
     current_gp, current_sp = load_tuning()
+    # ΔSmile ชดเชยการก้ม/เงย (เงยหน้าเดิมดูเหมือนยิ้ม → เลื่อนขึ้นไม่ได้)
+    k = estimate_smile_pitch_comp(sessions)
+    if k is not None:
+        print(f"  😊 ค่าชดเชยการก้ม/เงยของ ΔSmile (จาก regression): {current_gp.smile_pitch_comp:.2f} → {k:.2f}")
+        current_gp = replace(current_gp, smile_pitch_comp=k)
+    sessions = [Session(s.sid, s.df, current_gp.smile_pitch_comp) for s in sessions]
+    signal_summary(sessions)
     base = evaluate(sessions, current_gp)
     print_result("ค่าปัจจุบัน", base)
-    default = evaluate(sessions, GestureParams())
+    default = evaluate(sessions, replace(GestureParams(), smile_pitch_comp=current_gp.smile_pitch_comp))
     print_result("ค่า default", default)
     if args.eval_only:
         return
 
     print(f"\n  🔎 ค้นหาพารามิเตอร์ ({args.iters} รอบ)...")
-    start = current_gp if base["score"] >= default["score"] else GestureParams()
+    start = current_gp if base["score"] >= default["score"] else replace(
+        GestureParams(), smile_pitch_comp=current_gp.smile_pitch_comp)
     best_gp, best = search(sessions, start, args.iters, args.seed)
     print_result("ค่าที่จูนแล้ว", best)
 

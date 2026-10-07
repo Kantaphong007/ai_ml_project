@@ -3,13 +3,13 @@ EYE ORDER COME AI — Overlay Widget
 แสดง transparent overlay บนหน้าจอ แสดงสถานะระบบ
 """
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import SCREEN_WIDTH, SCREEN_HEIGHT
+from config.settings import SCREEN_WIDTH
 
 
 class OverlayWidget(QWidget):
@@ -36,7 +36,7 @@ class OverlayWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         
         # ตำแหน่ง: มุมบนขวา
-        self.setGeometry(SCREEN_WIDTH - 280, 10, 260, 200)
+        self.setGeometry(SCREEN_WIDTH - 300, 10, 290, 240)
         
         self._status = {}
         self._build_ui()
@@ -62,6 +62,12 @@ class OverlayWidget(QWidget):
         self._state_label.setFont(font)
         self._state_label.setStyleSheet("color: #CCCCFF;")
         layout.addWidget(self._state_label)
+
+        self._decision_label = QLabel("")
+        self._decision_label.setFont(font)
+        self._decision_label.setWordWrap(True)
+        self._decision_label.setStyleSheet("color: #FFCC88;")
+        layout.addWidget(self._decision_label)
 
         self._smile_label = QLabel("ΔSmile: 0.00%")
         self._smile_label.setFont(font)
@@ -109,6 +115,8 @@ class OverlayWidget(QWidget):
         self._state_label.setText(
             f"State: {status.get('gesture_state', '—')}  "
             f"({status.get('ratio_l', 0):.2f}/{status.get('ratio_r', 0):.2f})")
+
+        self._decision_label.setText(status.get("decision", ""))
 
         ds = status.get("delta_smile", 0)
         self._smile_label.setText(f"ΔSmile: {ds*100:.1f}%")

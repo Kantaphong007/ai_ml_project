@@ -58,7 +58,8 @@ def test_right_wink_click():
 
 
 def test_short_wink_ignored():
-    out, _ = run([(1, OPEN, OPEN), (0.2, CLOSED, OPEN), (1, OPEN, OPEN)])
+    # ตากระตุก 2 เฟรม (0.07 วิ) = noise ไม่ใช่ขยิบ (ขยิบชัดต้อง ≥ clear_wink_min_s 0.10 วิ)
+    out, _ = run([(1, OPEN, OPEN), (0.07, CLOSED, OPEN), (1, OPEN, OPEN)])
     assert out == []
 
 
@@ -83,23 +84,58 @@ def test_blink_with_one_eye_lagging_is_not_wink():
 
 def test_long_wink_is_drag_not_click():
     out, _ = run([(1, OPEN, OPEN), (1.6, CLOSED, OPEN), (1, OPEN, OPEN)])
-    assert names(out) == ["drag_toggle"]
+    assert names(out) == ["drag_start", "drag_end"]
 
 
-def test_drag_toggle_twice():
-    out, _ = run([(1, OPEN, OPEN), (1.6, CLOSED, OPEN), (1, OPEN, OPEN),
-                  (1.6, CLOSED, OPEN), (1, OPEN, OPEN)])
-    assert names(out) == ["drag_toggle", "drag_toggle"]
+def test_drag_released_when_eye_opens():
+    out, _ = run([(1, OPEN, OPEN), (3.0, CLOSED, OPEN), (1, OPEN, OPEN)])
+    starts = [t for e, t in out if e == "drag_start"]
+    ends = [t for e, t in out if e == "drag_end"]
+    assert names(out) == ["drag_start", "drag_end"]
+    assert 2.1 <= starts[0] <= 2.4          # หลับครบ drag_hold_s (1.2 วิ) → กดค้าง
+    assert 4.0 <= ends[0] <= 4.3            # ลืมตาที่ 4.0 วิ → ปล่อยทันที (ไม่ต้องหลับซ้ำ)
 
 
-def test_smile_scroll_toggle_once():
+def test_long_drag_not_cut_by_episode_timeout():
+    out, _ = run([(1, OPEN, OPEN), (8.0, CLOSED, OPEN), (1, OPEN, OPEN)])
+    assert names(out) == ["drag_start", "drag_end"]
+    assert [t for e, t in out if e == "drag_end"][0] >= 9.0
+
+
+def test_cursor_follows_head_while_dragging():
+    det = GestureDetector(OPEN, OPEN)
+    t, frozen = 0.0, []
+    for dur, el, er in [(1, OPEN, OPEN), (3.0, CLOSED, OPEN)]:
+        for _ in range(int(dur / DT)):
+            det.update(t, el, er, 0.0)
+            if det.dragging:
+                frozen.append(det.freeze_cursor)
+            t += DT
+    assert frozen and not any(frozen[6:])   # ไม่ตรึงเคอร์เซอร์ระหว่างลาก
+
+
+def test_drag_end_not_blocked_by_cooldown():
+    # ลืมตาเร็วมากหลัง drag_start (< event_cooldown_s) → ต้องปล่อยเมาส์เสมอ
+    out, _ = run([(1, OPEN, OPEN), (1.25, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.0)
+    assert names(out) == ["drag_start", "drag_end"]
+
+
+def test_smile_holds_scroll_mode_until_smile_ends():
     out, _ = run([(3, OPEN, OPEN)], smile=lambda t: 0.3 if 0.5 < t < 2.5 else 0.0)
-    assert names(out) == ["scroll_toggle"]
+    assert names(out) == ["scroll_start", "scroll_end"]
 
 
 def test_brief_smile_ignored():
-    out, _ = run([(3, OPEN, OPEN)], smile=lambda t: 0.3 if 0.5 < t < 0.8 else 0.0)
+    out, _ = run([(3, OPEN, OPEN)], smile=lambda t: 0.3 if 0.5 < t < 0.7 else 0.0)
     assert out == []
+
+
+def test_scroll_ends_quickly_after_smile_ends():
+    out, _ = run([(4, OPEN, OPEN)], smile=lambda t: 0.3 if 0.5 < t < 2.5 else 0.0)
+    t_start = [t for e, t in out if e == "scroll_start"][0]
+    t_end = [t for e, t in out if e == "scroll_end"][0]
+    assert 0.75 <= t_start <= 0.95           # ยิ้มค้าง smile_hold_s (0.3 วิ) → เข้าโหมด
+    assert 2.5 <= t_end <= 2.9               # หุบยิ้ม → ออกภายใน ~0.3 วิ
 
 
 def test_ear_noise_near_threshold_no_flicker():
@@ -109,7 +145,6 @@ def test_ear_noise_near_threshold_no_flicker():
 
 
 def test_cursor_frozen_during_wink_and_released_after():
-    rnd = random.Random(3)
     det = GestureDetector(OPEN, OPEN)
     t, frozen_during, frozen_end = 0.0, [], None
     for dur, el, er in [(1, OPEN, OPEN), (0.5, CLOSED, OPEN), (1, OPEN, OPEN)]:
@@ -188,6 +223,55 @@ def test_one_frame_dropout_does_not_split_wink():
     # landmark กระตุกเปิด 1 เฟรมกลางการขยิบ → ยังเป็นคลิกเดียว
     out, _ = run([(1, OPEN, OPEN), (0.25, CLOSED, OPEN), (DT, OPEN, OPEN),
                   (0.25, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.0)
+    assert names(out) == ["left_click"]
+
+
+def test_slow_reopen_after_deep_wink_still_clicks():
+    # หลับลึกแล้วค่อยๆ ลืม ค้างที่ ~80% (ไม่ถึง open_ratio) → เดิมถูกยกเลิก ต้องคลิก
+    out, det = run([(1, OPEN, OPEN), (0.5, CLOSED, OPEN), (1.0, OPEN * 0.70, OPEN), (1, OPEN, OPEN)],
+                   noise=0.004)
+    assert names(out) == ["left_click"], det.last_decision
+
+
+def test_decision_reason_is_reported():
+    out, det = run([(1, OPEN, OPEN), (1.15, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.0)
+    assert out == [] and "นาน" in det.last_decision      # ขยิบนานเกิน → บอกเหตุผล
+
+
+def test_quick_clear_wink_clicks():
+    # ขยิบเร็ว 0.2 วิ (แบบที่ผู้ใช้จริงทำ) แต่อีกตาเปิดปกติ → คลิก
+    out, _ = run([(1, OPEN, OPEN), (0.2, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.004)
+    assert names(out) == ["left_click"]
+
+
+def test_quick_blink_with_lag_is_not_wink():
+    # กะพริบเร็ว สองตาปิด (อีกตาลงต่ำด้วย) → ไม่ใช่ขยิบชัด → ไม่คลิก
+    out, _ = run([(1, OPEN, OPEN), (0.07, CLOSED, OPEN * 0.6), (0.1, CLOSED, CLOSED),
+                  (1, OPEN, OPEN)], noise=0.004)
+    assert out == []
+
+
+def test_two_quick_winks_same_eye_is_double_click():
+    out, _ = run([(1, OPEN, OPEN), (0.2, CLOSED, OPEN), (0.25, OPEN, OPEN),
+                  (0.2, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.004)
+    assert names(out) == ["left_click", "double_click"]
+
+
+def test_two_winks_far_apart_are_two_clicks():
+    out, _ = run([(1, OPEN, OPEN), (0.2, CLOSED, OPEN), (2.0, OPEN, OPEN),
+                  (0.2, CLOSED, OPEN), (1, OPEN, OPEN)], noise=0.004)
+    assert names(out) == ["left_click", "left_click"]
+
+
+def test_w_shaped_double_blink_in_one_episode():
+    # ท่าดับเบิลคลิกจริงของผู้ใช้: ตาปิด → เปิดขึ้นครึ่งทาง (ไม่ถึง open_ratio) → ปิดอีกรอบ
+    out, det = run([(1, OPEN, OPEN), (0.15, OPEN * 0.3, OPEN * 0.8), (0.12, OPEN * 0.6, OPEN * 0.85),
+                    (0.15, OPEN * 0.35, OPEN * 0.8), (1, OPEN, OPEN)], noise=0.004)
+    assert names(out) == ["double_click"], det.last_decision
+
+
+def test_single_long_wink_is_not_double():
+    out, _ = run([(1, OPEN, OPEN), (0.45, OPEN * 0.3, OPEN * 0.9), (1, OPEN, OPEN)], noise=0.008)
     assert names(out) == ["left_click"]
 
 

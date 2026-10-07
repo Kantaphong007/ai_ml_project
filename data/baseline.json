@@ -1,6 +1,11 @@
 {
-  "baseline_mouth_width": 0.07270019716551368,
-  "baseline_ear_l": 0.28739827014927527,
-  "baseline_ear_r": 0.3289903720629325,
-  "num_frames": 210
+  "baseline_mouth_ratio": 0.6465012904993936,
+  "baseline_pitch": 0.04365116046489502,
+  "head_yaw": -0.8882383192067729,
+  "head_pitch": -1.4664600693696443,
+  "mirror": true,
+  "baseline_ear_l": 0.2924602924349072,
+  "baseline_ear_r": 0.3189907247321252,
+  "ear_version": 2,
+  "num_frames": 162
 }

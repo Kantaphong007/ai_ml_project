@@ -9,29 +9,20 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 import warnings
 import numpy as np
-import pandas as pd
 import joblib
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-from sklearn.model_selection import train_test_split, learning_curve
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error, r2_score,
-    accuracy_score, f1_score, confusion_matrix, classification_report
-)
+from sklearn.model_selection import learning_curve
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
-    CALIBRATION_DATA_PATH, GESTURE_DATA_PATH,
-    CURSOR_MODEL_PATH, CLICK_MODEL_PATH,
-    DATA_DIR, CLASS_NAMES
+    CALIBRATION_DATA_PATH, CURSOR_MODEL_PATH, CLICK_MODEL_PATH, DATA_DIR,
 )
-from core.feature_extractor import FeatureExtractor
 
 
 def evaluate_cursor_model():
@@ -57,48 +48,46 @@ def evaluate_cursor_model():
         print("  ❌ ไม่พบข้อมูล calibration")
         return None
     
-    # ใช้ขั้นตอนโหลด/ทำความสะอาด/แบ่งกลุ่มเดียวกับตอนเทรน (พับมุม + แบ่งตามการเยี่ยมจุด)
-    from sklearn.model_selection import GroupShuffleSplit
-    from training.train_cursor_model import load_data as load_cursor_data
+    # ใช้ขั้นตอนโหลด/ทำความสะอาดเดียวกับตอนเทรน + ชุดฟีเจอร์ที่โมเดลเลือกไว้
+    from sklearn.base import clone
+    from sklearn.model_selection import GroupKFold, cross_val_predict
+    from sklearn.pipeline import make_pipeline
+    from training.train_cursor_model import load_data as load_cursor_data, ALL_FEATURES
     loaded = load_cursor_data()
     if loaded is None:
         return None
-    X, y, _, groups = loaded
-    _, test_idx = next(GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42).split(X, y, groups))
-    X_test, y_test = X[test_idx], y[test_idx]
-    
-    if scaler:
-        X_test_scaled = scaler.transform(X_test)
-    else:
-        X_test_scaled = X_test
-    
-    y_pred = model.predict(X_test_scaled)
-    
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    r2 = r2_score(y_test, y_pred)
-    mae_x = mean_absolute_error(y_test[:, 0], y_pred[:, 0])
-    mae_y = mean_absolute_error(y_test[:, 1], y_pred[:, 1])
-    
-    print(f"\n  Results:")
+    _, y, df, groups = loaded
+    cols = model_data.get("feature_cols") or ALL_FEATURES
+    if any(c not in df.columns for c in cols):
+        print("  ❌ โมเดล/ข้อมูล cursor คนละรุ่นกัน — Calibrate + Train Cursor ใหม่")
+        return None
+    X = df[cols].values
+    print(f"  ฟีเจอร์: {cols}")
+
+    # โมเดลที่บันทึกเทรนบนข้อมูลทั้งหมดแล้ว → ประเมินด้วย GroupKFold (เทรนใหม่ทุก fold) ไม่ให้ดีเกินจริง
+    pipe = make_pipeline(clone(scaler), clone(model)) if scaler else clone(model)
+    cv = GroupKFold(n_splits=min(6, len(np.unique(groups))))
+    y_pred = cross_val_predict(pipe, X, y, groups=groups, cv=cv)
+    mae = mean_absolute_error(y, y_pred)
+    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    r2 = r2_score(y, y_pred)
+    mae_x = mean_absolute_error(y[:, 0], y_pred[:, 0])
+    mae_y = mean_absolute_error(y[:, 1], y_pred[:, 1])
+
+    print("\n  Results (GroupKFold out-of-fold):")
     print(f"    MAE:    {mae:.2f} px (X: {mae_x:.2f}, Y: {mae_y:.2f})")
     print(f"    RMSE:   {rmse:.2f} px")
     print(f"    R²:     {r2:.4f}")
-    
+
     # Learning Curve
     save_dir = os.path.join(DATA_DIR, "plots")
     os.makedirs(save_dir, exist_ok=True)
-    
-    if scaler:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = X
-    
+
     try:
         train_sizes, train_scores, test_scores = learning_curve(
-            model, X_scaled, y,
-            cv=5, n_jobs=-1,
-            train_sizes=np.linspace(0.1, 1.0, 10),
+            pipe, X, y, groups=groups,
+            cv=cv, n_jobs=-1,
+            train_sizes=np.linspace(0.2, 1.0, 8),
             scoring="neg_mean_absolute_error"
         )
         
@@ -138,113 +127,74 @@ def evaluate_cursor_model():
 
 
 def evaluate_click_model():
-    """ประเมิน Click Classification Model"""
+    """ประเมิน Click Classification Model (hybrid episode classifier)
+
+    ผลหลักมาจากตอนเทรน (out-of-fold + event-level เทียบ rule-based) ที่บันทึกในไฟล์โมเดล
+    และสร้าง learning curve ใหม่จาก data/gesture_signals.csv
+    """
+    from core.episode_features import FEATURE_VERSION
+    from config.tuning import load_tuning
+    from training.signal_data import SIGNALS_PATH, load_sessions
+    from training.train_click_model import build_dataset, make_cv
+
     print("\n" + "=" * 60)
     print("  CLICK MODEL EVALUATION")
     print("=" * 60)
-    
-    # โหลดโมเดล
+
     if not os.path.exists(CLICK_MODEL_PATH):
-        print("  ❌ ไม่พบโมเดล click")
+        print("  ❌ ไม่พบโมเดล click — Record Signals แล้วกด Train Click")
         return None
-    
-    model_data = joblib.load(CLICK_MODEL_PATH)
-    model = model_data["model"]
-    scaler = model_data.get("scaler")
-    name = model_data.get("name", "Unknown")
-    
-    print(f"  โมเดล: {name}")
-    
-    # โหลดข้อมูล
-    if not os.path.exists(GESTURE_DATA_PATH):
-        print("  ❌ ไม่พบข้อมูล gesture")
+    data = joblib.load(CLICK_MODEL_PATH)
+    if data.get("feature_version") != FEATURE_VERSION:
+        print("  ❌ โมเดล click เป็นรูปแบบเก่า — Record Signals แล้วกด Train Click ใหม่")
         return None
-    
-    df = pd.read_csv(GESTURE_DATA_PATH)
-    X = df.drop(columns=["class"]).values
-    y = df["class"].values.astype(int)
-    
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    
-    if scaler:
-        X_test_scaled = scaler.transform(X_test)
-    else:
-        X_test_scaled = X_test
-    
-    y_pred = model.predict(X_test_scaled)
-    
-    acc = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-    cm = confusion_matrix(y_test, y_pred)
-    
-    unique_classes = sorted(np.unique(y_test))
-    class_labels = [CLASS_NAMES.get(i, f"Class {i}") for i in unique_classes]
-    
-    report = classification_report(
-        y_test, y_pred,
-        target_names=class_labels,
-        zero_division=0
-    )
-    
-    print(f"\n  Results:")
-    print(f"    Accuracy: {acc:.4f}")
-    print(f"    F1-Score: {f1:.4f}")
-    print(f"\n  Classification Report:")
-    print(report)
-    
-    # Learning Curve
-    save_dir = os.path.join(DATA_DIR, "plots")
-    os.makedirs(save_dir, exist_ok=True)
-    
-    if scaler:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = X
-    
-    try:
-        train_sizes, train_scores, test_scores = learning_curve(
-            model, X_scaled, y,
-            cv=5, n_jobs=-1,
-            train_sizes=np.linspace(0.1, 1.0, 10),
-            scoring="accuracy"
-        )
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        train_mean = train_scores.mean(axis=1)
-        test_mean = test_scores.mean(axis=1)
-        train_std = train_scores.std(axis=1)
-        test_std = test_scores.std(axis=1)
-        
-        ax.plot(train_sizes, train_mean, 'o-', color='steelblue',
-                label='Training Accuracy')
-        ax.fill_between(train_sizes, train_mean - train_std,
-                       train_mean + train_std, alpha=0.1, color='steelblue')
-        ax.plot(train_sizes, test_mean, 'o-', color='coral',
-                label='Validation Accuracy')
-        ax.fill_between(train_sizes, test_mean - test_std,
-                       test_mean + test_std, alpha=0.1, color='coral')
-        
-        ax.set_xlabel('Training Set Size')
-        ax.set_ylabel('Accuracy')
-        ax.set_title(f'Learning Curve — {name}')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 1.05)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, "click_learning_curve.png"), dpi=150)
-        plt.close()
-        print(f"\n  📊 Learning curve: {save_dir}/click_learning_curve.png")
-    except Exception as e:
-        print(f"  ⚠️ ไม่สามารถสร้าง learning curve: {e}")
-    
-    return {
-        "name": name,
-        "Accuracy": acc, "F1": f1,
-        "confusion_matrix": cm,
-    }
+
+    name, m, ev = data["name"], data["metrics"], data["event_eval"]
+    print(f"  โมเดล: {name}  (เทรน {data.get('trained', '?')}, {data.get('n_samples', '?')} episode)")
+    print(f"  ใช้สั่งคลิกจริง: {'ใช่' if data.get('use_live') else 'ไม่ (ใช้ rule-based)'}")
+    print("\n  Episode level (out-of-fold):")
+    print(f"    Accuracy {m['Accuracy']:.4f} | Precision {m['Precision']:.4f} | "
+          f"Recall {m['Recall']:.4f} | F1(macro) {m['F1']:.4f}")
+    print(f"\n  Event level ({ev['method']}):")
+    print(f"    {'':<14}{'Rule-based':>12}{'ML':>10}")
+    for label, acc in ev["rule"]["acc"].items():
+        print(f"    {label:<14}{acc:>12.1%}{ev['ml']['acc'].get(label, 0):>10.1%}")
+    print(f"    {'balanced acc':<14}{ev['rule']['balanced_acc']:>12.1%}{ev['ml']['balanced_acc']:>10.1%}")
+    print(f"    {'FP/min':<14}{ev['rule']['fp_per_min']:>12.2f}{ev['ml']['fp_per_min']:>10.2f}")
+
+    # Learning curve (ข้อมูลมากขึ้น → ดีขึ้นไหม = ควรอัดเพิ่มหรือยัง)
+    sessions = load_sessions(SIGNALS_PATH, smile_comp=load_tuning()[0].smile_pitch_comp)
+    if sessions:
+        try:
+            gp, _ = load_tuning()
+            X, y, groups, sids = build_dataset(sessions, gp)
+            cv, cv_groups, _ = make_cv(y, groups, sids)
+            train_sizes, train_scores, test_scores = learning_curve(
+                data["model"], X, y, groups=cv_groups, cv=cv, n_jobs=-1,
+                train_sizes=np.linspace(0.2, 1.0, 8), scoring="f1_macro")
+            save_dir = os.path.join(DATA_DIR, "plots")
+            os.makedirs(save_dir, exist_ok=True)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for scores, color, label in ((train_scores, "steelblue", "Training F1 (macro)"),
+                                         (test_scores, "coral", "Validation F1 (macro)")):
+                mean, std = scores.mean(axis=1), scores.std(axis=1)
+                ax.plot(train_sizes, mean, "o-", color=color, label=label)
+                ax.fill_between(train_sizes, mean - std, mean + std, alpha=0.1, color=color)
+            ax.set_xlabel("Training Set Size (episodes)")
+            ax.set_ylabel("F1 (macro)")
+            ax.set_title(f"Learning Curve — {name}")
+            ax.set_ylim(0, 1.05)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, "click_learning_curve.png"), dpi=150)
+            plt.close()
+            print(f"\n  📊 Learning curve: {save_dir}/click_learning_curve.png")
+        except Exception as e:
+            print(f"  ⚠️ ไม่สามารถสร้าง learning curve: {e}")
+
+    return {"name": name, "Accuracy": m["Accuracy"], "F1": m["F1"],
+            "event_ml": ev["ml"], "event_rule": ev["rule"]}
 
 
 def generate_full_report():
@@ -269,8 +219,10 @@ def generate_full_report():
     
     if click_result:
         print(f"\n  🖱️ Click Model: {click_result['name']}")
-        print(f"     Accuracy: {click_result['Accuracy']:.4f}")
-        print(f"     F1-Score: {click_result['F1']:.4f}")
+        print(f"     Accuracy: {click_result['Accuracy']:.4f}  F1 (macro): {click_result['F1']:.4f}")
+        print(f"     ใช้งานจริง: ถูกต้อง {click_result['event_ml']['balanced_acc']:.1%} "
+              f"(rule-based {click_result['event_rule']['balanced_acc']:.1%}), "
+              f"คลิกผิด {click_result['event_ml']['fp_per_min']:.2f}/นาที")
     else:
         print("\n  ❌ Click Model: ยังไม่ได้เทรน")
     

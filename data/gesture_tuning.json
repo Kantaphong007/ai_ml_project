@@ -1,0 +1,54 @@
+{
+  "gesture": {
+    "close_ratio": 0.61875,
+    "open_ratio": 0.69875,
+    "freeze_ratio": 0.8991651102050344,
+    "wink_asym": 0.21250000000000002,
+    "wink_side_frac": 0.56875,
+    "blink_depth": 0.3,
+    "smile_on": 0.16,
+    "smile_off": 0.096,
+    "smile_freeze": 0.08,
+    "smile_pitch_comp": 0.7709694467709274,
+    "wink_min_s": 0.15625,
+    "clear_wink_min_s": 0.12,
+    "quick_wink_max_s": 0.23750000000000002,
+    "wink_max_s": 0.8125,
+    "blink_max_s": 0.38125,
+    "double_blink_gap_s": 0.35,
+    "smile_hold_s": 0.6125,
+    "open_confirm_s": 0.015
+  },
+  "scroll": {
+    "deadzone": 0.0478,
+    "full_speed": 0.1528
+  },
+  "meta": {
+    "updated": "2026-10-07 18:24:29",
+    "sessions": 5,
+    "trials": {
+      "idle": 5,
+      "drag": 25,
+      "nod_down": 25,
+      "double_blink": 40,
+      "wink_right": 40,
+      "smile": 30,
+      "blink": 40,
+      "nod_up": 25,
+      "wink_left": 40
+    },
+    "score_before": 0.7873,
+    "score_after": 0.8319,
+    "acc_after": {
+      "drag": 0.72,
+      "nod_down": 0.96,
+      "double_blink": 0.475,
+      "wink_right": 0.825,
+      "smile": 0.933,
+      "blink": 1.0,
+      "nod_up": 1.0,
+      "wink_left": 0.925
+    },
+    "fp_per_min_after": 0.458
+  }
+}

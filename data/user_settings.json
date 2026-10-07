@@ -1,6 +1,7 @@
 {
-  "smoothing": 5,
-  "speed": 1.0,
+  "smoothing": 1,
+  "speed": 0.8,
+  "stability": 25,
   "camera": 0,
   "mirror": true,
   "invert_x": false,

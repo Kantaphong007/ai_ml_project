@@ -34,6 +34,37 @@ if _IS_WINDOWS:
     _WHEEL = 0x0800
     _WHEEL_DELTA = 120
 
+_IS_MAC = (sys.platform == 'darwin')
+if _IS_MAC:
+    try:
+        import Quartz   # มากับ pyautogui (pyobjc) — ส่ง event ตรง เร็วกว่า + รองรับ drag
+    except ImportError:
+        Quartz = None
+
+
+def has_input_permission():
+    """macOS: โปรแกรมได้สิทธิ์ Accessibility หรือยัง (ไม่ได้ = ระบบทิ้ง event เมาส์ทั้งหมดแบบเงียบๆ)
+
+    Windows/Linux คืน True เสมอ
+    """
+    if not _IS_MAC:
+        return True
+    try:
+        lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        return bool(lib.AXIsProcessTrusted())
+    except Exception:
+        return True
+
+
+def open_input_permission_settings():
+    """เปิดหน้า System Settings → Privacy & Security → Accessibility (macOS)"""
+    if _IS_MAC:
+        import subprocess
+        subprocess.Popen(["open", "x-apple.systempreferences:"
+                          "com.apple.preference.security?Privacy_Accessibility"])
+
 
 class MouseController:
     """ควบคุมเมาส์ผ่าน Win32 API
@@ -77,6 +108,11 @@ class MouseController:
             return
         if _IS_WINDOWS:
             _user32.SetCursorPos(tx, ty)
+        elif _IS_MAC and Quartz is not None:
+            # ขณะกดค้าง (drag) ต้องส่ง LeftMouseDragged ไม่งั้นแอปไม่รู้ว่ากำลังลาก
+            kind = Quartz.kCGEventLeftMouseDragged if self._drag_mode else Quartz.kCGEventMouseMoved
+            ev = Quartz.CGEventCreateMouseEvent(None, kind, (tx, ty), Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
         else:
             pyautogui.moveTo(tx, ty, duration=0)
         self._last_pos = (tx, ty)
@@ -87,46 +123,61 @@ class MouseController:
             return
         self._set_pos(x, y)
 
-    def _button(self, down_flag, up_flag, x=None, y=None, repeat=1):
+    def _button(self, button, x=None, y=None, count=1):
+        """คลิก `count` ครั้งติดกัน (2 = ดับเบิลคลิก) ที่ (x, y) หรือตำแหน่งปัจจุบัน"""
         if x is not None and y is not None:
             self._set_pos(x, y)
         if _IS_WINDOWS:
-            for _ in range(repeat):
-                _user32.mouse_event(down_flag, 0, 0, 0, 0)
+            down, up = (_LEFTDOWN, _LEFTUP) if button == "left" else (_RIGHTDOWN, _RIGHTUP)
+            for i in range(count):      # Windows นับดับเบิลคลิกจากจังหวะเวลาเอง
+                _user32.mouse_event(down, 0, 0, 0, 0)
                 time.sleep(0.012)
-                _user32.mouse_event(up_flag, 0, 0, 0, 0)
-                if repeat > 1:
+                _user32.mouse_event(up, 0, 0, 0, 0)
+                if i < count - 1:
                     time.sleep(0.04)
+        elif _IS_MAC and Quartz is not None:
+            self._quartz_click(button, count)
         else:
-            button = 'left' if down_flag == 0x0002 else 'right'
-            pyautogui.click(button=button, clicks=repeat)
+            pyautogui.click(button=button, clicks=count)
+
+    def _current_pos(self):
+        if self._last_pos is not None:
+            return self._last_pos
+        p = pyautogui.position()
+        return int(p[0]), int(p[1])
+
+    def _quartz_post(self, kind, button, click_state):
+        btn = Quartz.kCGMouseButtonLeft if button == "left" else Quartz.kCGMouseButtonRight
+        ev = Quartz.CGEventCreateMouseEvent(None, kind, self._current_pos(), btn)
+        # macOS ไม่นับดับเบิลคลิกจากจังหวะเวลาให้ event ที่โปรแกรมส่งเอง ต้องระบุ click count ตรงๆ
+        # (pyautogui ส่งคลิกเดี่ยว 2 ครั้ง → แอปบน Mac ไม่เห็นเป็นดับเบิลคลิก)
+        Quartz.CGEventSetIntegerValueField(ev, Quartz.kCGMouseEventClickState, click_state)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+
+    def _quartz_click(self, button, count):
+        down = Quartz.kCGEventLeftMouseDown if button == "left" else Quartz.kCGEventRightMouseDown
+        up = Quartz.kCGEventLeftMouseUp if button == "left" else Quartz.kCGEventRightMouseUp
+        for n in range(1, count + 1):
+            self._quartz_post(down, button, n)
+            time.sleep(0.012)
+            self._quartz_post(up, button, n)
+            if n < count:
+                time.sleep(0.04)
 
     def left_click(self, x=None, y=None):
         """คลิกซ้ายที่ (x, y) — ถ้าไม่ระบุคลิกที่ตำแหน่งปัจจุบัน"""
-        if not self._enabled:
-            return
-        if _IS_WINDOWS:
-            self._button(_LEFTDOWN, _LEFTUP, x, y)
-        else:
-            self._button(0x0002, 0x0004, x, y)
+        if self._enabled:
+            self._button("left", x, y)
 
     def right_click(self, x=None, y=None):
         """คลิกขวา"""
-        if not self._enabled:
-            return
-        if _IS_WINDOWS:
-            self._button(_RIGHTDOWN, _RIGHTUP, x, y)
-        else:
-            self._button(0x0008, 0x0010, x, y)
+        if self._enabled:
+            self._button("right", x, y)
 
     def double_click(self, x=None, y=None):
         """ดับเบิลคลิก"""
-        if not self._enabled:
-            return
-        if _IS_WINDOWS:
-            self._button(_LEFTDOWN, _LEFTUP, x, y, repeat=2)
-        else:
-            self._button(0x0002, 0x0004, x, y, repeat=2)
+        if self._enabled:
+            self._button("left", x, y, count=2)
 
     def mouse_down(self, x=None, y=None):
         """กดเมาส์ค้าง (เริ่ม Drag mode)"""
@@ -136,6 +187,8 @@ class MouseController:
             self._set_pos(x, y)
         if _IS_WINDOWS:
             _user32.mouse_event(_LEFTDOWN, 0, 0, 0, 0)
+        elif _IS_MAC and Quartz is not None:
+            self._quartz_post(Quartz.kCGEventLeftMouseDown, "left", 1)
         else:
             pyautogui.mouseDown()
         self._drag_mode = True
@@ -144,6 +197,8 @@ class MouseController:
         """ปล่อยเมาส์ (จบ Drag mode)"""
         if _IS_WINDOWS:
             _user32.mouse_event(_LEFTUP, 0, 0, 0, 0)
+        elif _IS_MAC and Quartz is not None:
+            self._quartz_post(Quartz.kCGEventLeftMouseUp, "left", 1)
         else:
             pyautogui.mouseUp()
         self._drag_mode = False

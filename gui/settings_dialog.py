@@ -8,7 +8,6 @@ from PyQt6.QtWidgets import (
     QGroupBox, QComboBox
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 
 import sys
 import os
@@ -89,6 +88,19 @@ class SettingsDialog(QDialog):
         # ── Mouse Settings ──
         mouse_group = QGroupBox("🖱️ Mouse Control")
         mouse_layout = QFormLayout(mouse_group)
+
+        self._mode_combo = QComboBox()
+        self._modes = [
+            ("hybrid", "Hybrid — หันหัวเหมือนเมาส์ + AI ช่วยตอนหันเร็ว (แนะนำ)"),
+            ("relative", "Relative — หันหัวเหมือนเมาส์ (ไม่ต้อง calibrate)"),
+            ("absolute", "Absolute — ชี้ตรงจุดที่หน้าหันไป (โมเดล ML ล้วน)"),
+        ]
+        for _, text in self._modes:
+            self._mode_combo.addItem(text)
+        keys = [k for k, _ in self._modes]
+        current = self._settings.get("cursor_mode", "hybrid")
+        self._mode_combo.setCurrentIndex(keys.index(current) if current in keys else 0)
+        mouse_layout.addRow("Cursor Mode:", self._mode_combo)
         
         self._smoothing_slider = QSlider(Qt.Orientation.Horizontal)
         self._smoothing_slider.setRange(1, 15)
@@ -113,6 +125,20 @@ class SettingsDialog(QDialog):
         h2.addWidget(self._speed_slider)
         h2.addWidget(self._speed_label)
         mouse_layout.addRow("Cursor Speed:", h2)
+
+        # ล็อกเคอร์เซอร์ตอนหัวนิ่ง: มาก = นิ่งมาก แต่ต้องขยับหัวเกินรัศมีนี้ก่อนเคอร์เซอร์จะตาม
+        self._stability_slider = QSlider(Qt.Orientation.Horizontal)
+        self._stability_slider.setRange(0, 40)
+        self._stability_slider.setValue(int(self._settings.get("stability", 24)))
+        self._stability_label = QLabel(f"{self._stability_slider.value()} px")
+        self._stability_slider.valueChanged.connect(
+            lambda v: self._stability_label.setText(f"{v} px")
+        )
+        h_st = QHBoxLayout()
+        h_st.addWidget(self._stability_slider)
+        h_st.addWidget(self._stability_label)
+        self._stability_slider.setToolTip("หัวนิ่ง = เคอร์เซอร์ล็อก; ขยับเกินรัศมีนี้ = เคอร์เซอร์ตาม (0 = ปิด)")
+        mouse_layout.addRow("Stability (deadzone):", h_st)
         
         self._invert_x_check = QCheckBox("Invert X (กลับทิศเมาส์ซ้าย-ขวา)")
         self._invert_x_check.setChecked(self._settings["invert_x"])
@@ -210,8 +236,10 @@ class SettingsDialog(QDialog):
     def get_settings(self):
         """ดึงค่าตั้งค่าปัจจุบัน"""
         return {
+            "cursor_mode": self._modes[self._mode_combo.currentIndex()][0],
             "smoothing": self._smoothing_slider.value(),
             "speed": self._speed_slider.value() / 10.0,
+            "stability": self._stability_slider.value(),
             "camera": self._camera_spin.value(),
             "mirror": self._mirror_check.isChecked(),
             "invert_x": self._invert_x_check.isChecked(),

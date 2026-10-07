@@ -5,9 +5,10 @@ EYE ORDER COME AI — Tunable parameters (ค่าที่จูนด้ว�
 ค่า default ด้านล่างเป็นค่าเริ่มต้นที่ใช้งานได้ — ค่าที่จูนแล้วจะถูกเขียนลง
 data/gesture_tuning.json โดย training/tune_gestures.py และโหลดทับตอนเริ่มระบบ
 
-ขั้นตอนจูน:
+ขั้นตอน:
   1. python calibration/signal_recorder.py   → บันทึกสัญญาณดิบพร้อม label (data/gesture_signals.csv)
   2. python training/tune_gestures.py        → replay + ค้นหาค่าที่ดีที่สุด → data/gesture_tuning.json
+  3. python training/train_click_model.py    → เทรนโมเดล ML จำแนกท่าทางตา (ใช้ episode ตามค่าข้อ 2)
 
 ไฟล์นี้ต้องไม่ import อะไรหนัก (pyautogui/cv2) เพื่อให้ test/สคริปต์จูนใช้ได้โดยไม่ต้องมีกล้อง
 """
@@ -34,19 +35,34 @@ class GestureParams:
     smile_on: float = 0.20
     smile_off: float = 0.12
     smile_freeze: float = 0.10
+    smile_pitch_comp: float = 0.80    # ชดเชยการก้ม/เงยของ ΔSmile (regression จากข้อมูลจริง)
+    smile_release_s: float = 0.25     # หุบยิ้มต่อเนื่องเท่านี้ → ออกจากโหมด scroll
 
     # ── เวลา (วินาที) ──
-    wink_min_s: float = 0.25
+    wink_min_s: float = 0.15
+    # ขยิบ "ชัด" = ตาหนึ่งหลับลึก (≤ deep_close_ratio) ขณะอีกตาเปิดเกือบปกติ (≥ clear_wink_other)
+    # แบบนี้ไม่ใช่การกะพริบแน่นอน (กะพริบปิดพร้อมกันสองตา) → ขยิบเร็วแค่ไหนก็นับ
+    clear_wink_min_s: float = 0.08      # ≥ 3 เฟรมที่ 30 FPS (2 เฟรม = noise)
+    clear_wink_other: float = 0.65
+    quick_wink_max_s: float = 0.50    # ปิดตาสั้นกว่านี้ 2 ครั้งติดกัน (แบบเดียวกัน) = ดับเบิลคลิก
+    dip_reopen_margin: float = 0.20   # ระหว่างสองรอบต้องเปิดถึง close_ratio − ค่านี้ (noise ตอนหลับสนิทไม่ถึง)
+    dip_rise: float = 0.06            # ตาเปิดขึ้นเท่านี้ระหว่างสองรอบ = ปิด 2 รอบ (ข้อมูลจริง: ท่าอื่นไม่เกิน 0.04, ดับเบิลคลิกถึง 0.29)
     wink_max_s: float = 1.10
     drag_hold_s: float = 1.20
     blink_max_s: float = 0.40
     double_blink_gap_s: float = 0.70  # จากลืมตาครั้งแรก → เริ่มหลับครั้งที่สอง
-    smile_hold_s: float = 0.50
+    smile_hold_s: float = 0.30        # ยิ้มค้างเท่านี้ถึงเข้าโหมด scroll (กันยิ้ม/พูดแวบเดียว)
     open_confirm_s: float = 0.06      # ต้องลืมตาต่อเนื่องเท่านี้ถึงจบ episode (กันค่ากระตุกเฟรมเดียว)
     release_s: float = 0.12           # ลืมตา/หยุดยิ้มต่อเนื่องเท่านี้ถึงปล่อยการตรึงเคอร์เซอร์
     event_cooldown_s: float = 0.35
-    half_open_abort_s: float = 0.40   # ค้างระหว่าง close–open นานเท่านี้ = ไม่ใช่การหลับตา → ยกเลิก
-    episode_timeout_s: float = 4.0    # หลับตานานกว่านี้ = ไม่ใช่ท่าทาง → เรียนค่าตาเปิดใหม่
+    half_open_abort_s: float = 0.40   # ค้างระหว่าง close–open นานเท่านี้ → จบ episode
+    deep_close_ratio: float = 0.45    # ถ้าเคยหลับลึกกว่านี้ = ท่าทางจริงที่ลืมตาช้า → ตัดสิน (ไม่ทิ้ง)
+    episode_timeout_s: float = 4.0
+    drag_release_confirm_s: float = 0.12  # ลืมตาต่อเนื่องเท่านี้ถึงปล่อย drag
+    drag_max_s: float = 30.0          # หลับตาลากนานสุด (กันเมาส์ค้าง)    # หลับตานานกว่านี้ = ไม่ใช่ท่าทาง → เรียนค่าตาเปิดใหม่
+
+    # ── โมเดล ML ──
+    ml_min_confidence: float = 0.60   # ML มั่นใจต่ำกว่านี้ → ใช้ rule-based ตัดสินแทน (ไม่ทิ้งท่าทาง)
 
     # ── ค่าอ้างอิงตาเปิดแบบปรับตัว (ตามท่าศีรษะ/แสงที่เปลี่ยน) ──
     ref_window_s: float = 1.5
@@ -64,7 +80,7 @@ class ScrollParams:
     smoothing: float = 0.30           # EMA ของสัญญาณ (0–1, มาก = ไว)
     settle_s: float = 0.30            # เก็บค่าหลังเลิกยิ้มนานเท่านี้ก่อนตั้งจุดอ้างอิง
     anchor_follow: float = 0.01       # จุดอ้างอิงค่อยๆ ตามท่านั่งขณะอยู่ใน deadzone (ต่อเฟรม)
-    idle_exit_s: float = 10.0         # อยู่ใน deadzone นานเท่านี้ → ออกโหมด scroll เอง (0 = ปิด)
+    idle_exit_s: float = 0.0          # 0 = ปิด (ออกจากโหมดด้วยการหุบยิ้มแทน)
     invert: bool = False              # True = ก้ม → เลื่อนขึ้น
 
 
@@ -96,7 +112,11 @@ def load_tuning(path=TUNING_PATH):
 
 def save_tuning(gesture_params, scroll_params, path=TUNING_PATH, meta=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = {"gesture": asdict(gesture_params), "scroll": asdict(scroll_params)}
+    # เก็บเฉพาะค่าที่ต่างจาก default → ปรับปรุง default ในโค้ดภายหลังแล้วยังมีผล
+    def changed(obj, default):
+        return {k: v for k, v in asdict(obj).items() if v != getattr(default, k)}
+    data = {"gesture": changed(gesture_params, GestureParams()),
+            "scroll": changed(scroll_params, ScrollParams())}
     if meta:
         data["meta"] = meta
     with open(path, "w", encoding="utf-8") as f:

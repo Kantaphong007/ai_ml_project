@@ -1,6 +1,7 @@
 """
 EYE ORDER COME AI — Baseline Recorder
-บันทึกค่าฐาน (neutral face) สำหรับ:
+บันทึกค่าฐาน (neutral face — นั่งหน้าตรงมองกลางจอ) สำหรับ:
+  - มุมศีรษะตอนหน้าตรง → จุดอ้างอิงของโหมด relative/hybrid (หน้าตรง = กลางจอ)
   - Mouth width baseline → ใช้คำนวณ ΔSmile
   - EAR baseline → ใช้ reference
 """
@@ -18,7 +19,7 @@ from core.face_mesh import FaceMeshDetector
 from core.feature_extractor import FeatureExtractor, EAR_VERSION
 from config.settings import (
     CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT, FPS,
-    BASELINE_DURATION_SEC, BASELINE_DATA_PATH
+    BASELINE_DURATION_SEC, BASELINE_DATA_PATH, load_user_settings,
 )
 
 
@@ -30,7 +31,11 @@ class BaselineRecorder:
     """
     
     def __init__(self):
-        self.camera = CameraStream(CAMERA_INDEX, FRAME_WIDTH, FRAME_HEIGHT, FPS)
+        # ใช้กล้อง/mirror เดียวกับตอนใช้งานจริง ไม่งั้นตาซ้าย-ขวาและทิศมุมศีรษะจะกลับด้าน
+        settings = load_user_settings()
+        self.mirror = bool(settings.get("mirror", True))
+        self.camera = CameraStream(settings.get("camera", CAMERA_INDEX), FRAME_WIDTH, FRAME_HEIGHT,
+                                   FPS, mirror=self.mirror)
         self.detector = FaceMeshDetector()
         self.extractor = FeatureExtractor(self.detector)
     
@@ -55,7 +60,7 @@ class BaselineRecorder:
         
         print("=" * 60)
         print("   BASELINE RECORDING")
-        print("   นั่งมองจอด้วยสีหน้าปกติ ไม่ยิ้ม ไม่กะพริบตา")
+        print("   นั่งหน้าตรงมองกลางจอ สีหน้าปกติ ไม่ยิ้ม ไม่กะพริบตา")
         print(f"   จะบันทึกเป็นเวลา {duration_sec} วินาที")
         print("=" * 60)
         print("\n  กด SPACE เพื่อเริ่มบันทึก...")
@@ -71,7 +76,7 @@ class BaselineRecorder:
                 cv2.putText(display, "Press SPACE to start baseline recording",
                            (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                            (0, 255, 255), 2)
-                cv2.putText(display, "Keep a neutral face - no smile, no blink",
+                cv2.putText(display, "Face the CENTER of the screen - neutral face, no smile",
                            (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                            (200, 200, 200), 1)
                 cv2.imshow("Baseline Recording", display)
@@ -88,6 +93,8 @@ class BaselineRecorder:
         
         # บันทึกค่า
         mouth_widths = []
+        pitches = []
+        head_poses = []
         ear_ls = []
         ear_rs = []
         
@@ -113,6 +120,11 @@ class BaselineRecorder:
                 mr = self.extractor.compute_mouth_ratio(landmarks)
                 if mr is not None:
                     mouth_widths.append(mr)
+                pitch = self.extractor.extract_head_pitch_signal(landmarks)
+                if pitch is not None:
+                    pitches.append(pitch)
+                if self.detector.head_pose is not None:
+                    head_poses.append(self.detector.head_pose[:2])
                 
                 frame_count += 1
             
@@ -149,6 +161,11 @@ class BaselineRecorder:
         # ใช้ median: ถ้าเผลอกะพริบตาระหว่างบันทึก ค่าฐานไม่ถูกดึงลง
         baseline = {
             "baseline_mouth_ratio": float(np.median(mouth_widths)),
+            "baseline_pitch": float(np.median(pitches)) if pitches else None,
+            # มุมศีรษะตอนหน้าตรง (องศา) — ใช้เป็น "กลางจอ" ของโหมด relative/hybrid
+            "head_yaw": float(np.median([p[0] for p in head_poses])) if head_poses else None,
+            "head_pitch": float(np.median([p[1] for p in head_poses])) if head_poses else None,
+            "mirror": self.mirror,
             "baseline_ear_l": float(np.median(ear_ls)),
             "baseline_ear_r": float(np.median(ear_rs)),
             "ear_version": EAR_VERSION,
@@ -164,6 +181,8 @@ class BaselineRecorder:
         print(f"     Mouth ratio: {baseline['baseline_mouth_ratio']:.4f}")
         print(f"     EAR_L:       {baseline['baseline_ear_l']:.4f}")
         print(f"     EAR_R:       {baseline['baseline_ear_r']:.4f}")
+        if baseline["head_yaw"] is not None:
+            print(f"     หน้าตรง:     yaw {baseline['head_yaw']:+.1f}°  pitch {baseline['head_pitch']:+.1f}°")
         print(f"     บันทึกไว้ที่: {BASELINE_DATA_PATH}")
         
         return baseline

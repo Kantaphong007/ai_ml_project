@@ -8,13 +8,10 @@ import os
 import time
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QFrame, QSizePolicy
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame,
 )
-from PyQt6.QtCore import (
-    Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve, pyqtSignal
-)
-from PyQt6.QtGui import QFont, QColor, QPainter, QPen, QBrush
+from PyQt6.QtCore import Qt, QTimer, QPoint, pyqtSignal
+from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
@@ -390,13 +387,9 @@ class OnScreenKeyboard(QWidget):
         if not self.isVisible():
             return
         
-        # แปลงเป็น widget coords
-        local_pos = self.mapFromGlobal(QPoint(int(x), int(y)))
-        
         # หาปุ่มที่ cursor อยู่บน
         hovered_btn = None
         for btn in self._buttons:
-            btn_rect = btn.geometry()
             # ต้องคำนวณตำแหน่งจาก parent layouts
             global_btn_pos = btn.mapToGlobal(QPoint(0, 0))
             btn_screen_rect = btn.rect().translated(global_btn_pos)

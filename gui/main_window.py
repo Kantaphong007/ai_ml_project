@@ -6,15 +6,13 @@ import sys
 import os
 import subprocess
 import cv2
-import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QPushButton, QLabel, QFrame, QGroupBox, QMessageBox,
-    QStatusBar, QProgressBar, QApplication
+    QPushButton, QLabel, QGroupBox, QMessageBox, QStatusBar,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt6.QtGui import QFont, QImage, QPixmap, QIcon
+from PyQt6.QtCore import Qt, QTimer, QEvent, pyqtSignal
+from PyQt6.QtGui import QFont, QImage, QPixmap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +20,10 @@ from core.pipeline import Pipeline
 from gui.overlay_widget import OverlayWidget
 from gui.onscreen_keyboard import OnScreenKeyboard
 from gui.settings_dialog import SettingsDialog
+import joblib
+from core.click_classifier import ClickClassifier
+from core.feature_extractor import CURSOR_FEATURE_VERSION
+from core.mouse_controller import has_input_permission, open_input_permission_settings
 from config.settings import (
     CURSOR_MODEL_PATH, CLICK_MODEL_PATH, load_user_settings
 )
@@ -206,6 +208,14 @@ class MainWindow(QMainWindow):
             setattr(self, attr, val)
             status_layout.addWidget(val, row, col * 2 + 1)
         
+        # เหตุผลการตัดสินท่าล่าสุด (ML/rule, ความมั่นใจ, ระยะเวลา) — ดูว่าทำไมขยิบแล้วไม่คลิก
+        self._decision_val = QLabel("—")
+        self._decision_val.setFont(font_mono)
+        self._decision_val.setWordWrap(True)
+        self._decision_val.setStyleSheet("color: #ffcc88;")
+        status_layout.addWidget(QLabel("Decision:"), (len(labels) + 1) // 2, 0)
+        status_layout.addWidget(self._decision_val, (len(labels) + 1) // 2, 1, 1, 3)
+
         right_layout.addWidget(status_group)
         
         # ── Control Buttons ──
@@ -242,34 +252,31 @@ class MainWindow(QMainWindow):
         
         ctrl_layout.addLayout(cal_layout)
         
-        # Data collection
-        self._gesture_btn = QPushButton("✋ Collect Gestures")
-        self._gesture_btn.clicked.connect(self._run_gesture_collection)
-        ctrl_layout.addWidget(self._gesture_btn)
-
-        # จูนการตรวจจับท่าทาง/scroll ด้วยข้อมูลจริง
-        tune_layout = QHBoxLayout()
+        # เก็บข้อมูลท่าทาง (dataset ของโมเดล click + ใช้จูน threshold/scroll)
         self._record_signals_btn = QPushButton("🎙 Record Signals")
-        self._record_signals_btn.setToolTip("บันทึกสัญญาณตา/ยิ้ม/ก้มเงย พร้อม label สำหรับจูนค่า")
+        self._record_signals_btn.setToolTip(
+            "บันทึกสัญญาณตา/ยิ้ม/ก้มเงยพร้อม label → data/gesture_signals.csv")
         self._record_signals_btn.clicked.connect(self._run_signal_recorder)
-        tune_layout.addWidget(self._record_signals_btn)
-        self._tune_btn = QPushButton("🔧 Tune Gestures")
-        self._tune_btn.setToolTip("ค้นหาค่าที่ดีที่สุดจากข้อมูลที่บันทึก → data/gesture_tuning.json")
-        self._tune_btn.clicked.connect(self._run_tuner)
-        tune_layout.addWidget(self._tune_btn)
-        ctrl_layout.addLayout(tune_layout)
-        
-        # Training buttons
+        ctrl_layout.addWidget(self._record_signals_btn)
+
+        # Training: ลำดับที่แนะนำ Train Cursor · Tune Gestures → Train Click
         train_layout = QHBoxLayout()
-        
+
         self._train_cursor_btn = QPushButton("🏋️ Train Cursor")
         self._train_cursor_btn.clicked.connect(self._train_cursor)
         train_layout.addWidget(self._train_cursor_btn)
-        
+
+        self._tune_btn = QPushButton("🔧 Tune")
+        self._tune_btn.setToolTip("จูนค่าหา episode / ยิ้ม / scroll จากข้อมูล → data/gesture_tuning.json\n"
+                                  "(กดก่อน Train Click)")
+        self._tune_btn.clicked.connect(self._run_tuner)
+        train_layout.addWidget(self._tune_btn)
+
         self._train_click_btn = QPushButton("🏋️ Train Click")
+        self._train_click_btn.setToolTip("เทรน + เปรียบเทียบ 5 โมเดลจำแนกท่าทางตา → models/click_model.pkl")
         self._train_click_btn.clicked.connect(self._train_click)
         train_layout.addWidget(self._train_click_btn)
-        
+
         ctrl_layout.addLayout(train_layout)
         
         # Evaluate
@@ -309,16 +316,46 @@ class MainWindow(QMainWindow):
     
     def _update_model_status(self):
         """อัพเดทสถานะโมเดล"""
+        info = None
         if os.path.exists(CURSOR_MODEL_PATH):
-            self._cursor_model_label.setText("Cursor Model: ✅ Loaded")
-            self._cursor_model_label.setStyleSheet("color: #88ddaa;")
+            try:
+                data = joblib.load(CURSOR_MODEL_PATH)
+                if data.get("feature_version") == CURSOR_FEATURE_VERSION:
+                    info = f"{data.get('name', '?')} MAE {data.get('metrics', {}).get('MAE', 0):.0f}px"
+            except Exception:
+                pass
+        mode = self.pipeline.cursor_mode
+        if mode == "relative":
+            text, color = "Cursor: 🖱️ Relative (ไม่ใช้โมเดล)", "#88ddaa"
+        elif info:
+            text = f"Cursor: {'🤖 Hybrid' if mode == 'hybrid' else '🎯 Absolute'} — {info}"
+            color = "#88ddaa"
+        elif mode == "hybrid":
+            text, color = "Cursor: Hybrid → relative (Calibrate + Train Cursor เพื่อเปิด AI)", "#ffcc66"
         else:
-            self._cursor_model_label.setText("Cursor Model: ❌ Not trained")
-            self._cursor_model_label.setStyleSheet("color: #ff8888;")
+            text, color = "Cursor: ❌ Absolute ต้อง Calibrate + Train Cursor", "#ff8888"
+        self._cursor_model_label.setText(text)
+        self._cursor_model_label.setStyleSheet(f"color: {color};")
         
-        # คลิกใช้ตัวตรวจจับท่าทางแบบ state machine (core/gesture_detector.py) ไม่ต้องเทรนโมเดล
-        self._click_model_label.setText("Click: ✅ Gesture detector (ขยิบตา/ยิ้ม)")
-        self._click_model_label.setStyleSheet("color: #88ddaa;")
+        clf = ClickClassifier()
+        if clf.load(verbose=False):
+            if clf.use_live:
+                f1 = clf.info.get("metrics", {}).get("F1", 0)
+                text, color = f"Click Model: 🤖 {clf.name} (F1 {f1:.2f})", "#88ddaa"
+            else:
+                text, color = f"Click Model: ⚠️ {clf.name} แพ้ rule-based → ใช้ rule", "#ffcc66"
+        elif os.path.exists(CLICK_MODEL_PATH):
+            text, color = "Click Model: ⚠️ รูปแบบเก่า → ใช้ rule (Train Click ใหม่)", "#ffcc66"
+        else:
+            text, color = "Click Model: ❌ ยังไม่เทรน → ใช้ rule-based", "#ff8888"
+        self._click_model_label.setText(text)
+        self._click_model_label.setStyleSheet(f"color: {color};")
+
+    def changeEvent(self, event):
+        # กลับมาที่หน้าต่างหลังเทรนใน console แยก → อัปเดตสถานะโมเดล
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._update_model_status()
+        super().changeEvent(event)
     
     def _toggle_pipeline(self):
         """เริ่ม/หยุด pipeline"""
@@ -344,15 +381,23 @@ class MainWindow(QMainWindow):
             if not self.pipeline.initialize():
                 QMessageBox.warning(
                     self, "Warning",
-                    "ไม่สามารถโหลดโมเดลได้\n"
-                    "กรุณา Calibrate + Train ก่อนใช้งาน"
+                    "โหมด Absolute ต้องมีโมเดล cursor\n"
+                    "กด Calibrate + Train Cursor หรือเปลี่ยนเป็นโหมด Hybrid/Relative ใน Settings"
                 )
                 return
             
             self.pipeline.on_frame_update = self._frame_ready.emit
             self.pipeline.on_status_update = self._status_ready.emit
-            self.pipeline.start()
+            try:
+                self.pipeline.start()
+            except RuntimeError as e:
+                hint = ("\n\nmacOS: เปิด System Settings → Privacy & Security → Camera\n"
+                        "แล้วอนุญาตให้ Terminal / VS Code (แอปที่ใช้รันโปรแกรม) จากนั้นปิดแอปนั้นแล้วเปิดใหม่"
+                        if sys.platform == "darwin" else "")
+                QMessageBox.critical(self, "Camera", f"เปิดกล้องไม่ได้\n{e}{hint}")
+                return
             self._running = True
+            self._warn_if_no_input_permission()
             self._start_btn.setText("⏸  Stop")
             self._start_btn.setStyleSheet("""
                 QPushButton {
@@ -368,10 +413,29 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage("Running — กดปุ่ม Pause/Break เพื่อหยุด/เริ่มชั่วคราว")
             self._enable_buttons(False)
     
+    def _warn_if_no_input_permission(self):
+        """macOS: ไม่มีสิทธิ์ Accessibility → เมาส์ไม่ขยับ/คลิกไม่ได้โดยไม่มี error ใดๆ"""
+        if has_input_permission():
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("ต้องอนุญาต Accessibility")
+        box.setText("macOS ยังไม่อนุญาตให้โปรแกรมควบคุมเมาส์ — กล้องทำงาน แต่เมาส์จะไม่ขยับ")
+        box.setInformativeText(
+            "System Settings → Privacy & Security → Accessibility\n"
+            "เปิดสวิตช์ให้แอปที่ใช้รันโปรแกรมนี้ (เช่น Antigravity IDE / Terminal)\n"
+            "จากนั้นปิดแอปนั้นให้หมด (Cmd+Q) แล้วเปิดใหม่")
+        open_btn = box.addButton("เปิด Settings", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("ปิด", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            open_input_permission_settings()
+        self._statusbar.showMessage("⚠️ ไม่มีสิทธิ์ Accessibility — เมาส์จะไม่ขยับจนกว่าจะอนุญาตและเปิดแอปใหม่")
+
     def _enable_buttons(self, enabled):
         """เปิด/ปิดปุ่มขณะ pipeline ทำงาน"""
         for btn in [self._baseline_btn, self._calibrate_btn,
-                    self._gesture_btn, self._train_cursor_btn,
+                    self._train_cursor_btn,
                     self._train_click_btn, self._eval_btn,
                     self._record_signals_btn, self._tune_btn]:
             btn.setEnabled(enabled)
@@ -427,6 +491,7 @@ class MainWindow(QMainWindow):
         
         self._action_val.setText(status.get("last_action", "—") or "—")
         self._state_val.setText(status.get("gesture_state", "—"))
+        self._decision_val.setText(status.get("decision") or "—")
         self._ratio_val.setText(f"{status.get('ratio_l', 0):.2f} / {status.get('ratio_r', 0):.2f}")
         self._scroll_val.setText(f"{status.get('scroll_offset', 0):+.3f}" if mode == "scroll" else "—")
     
@@ -440,10 +505,6 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage("Running 9-point calibration...")
         self._run_script("calibration/nine_point_calibration.py")
     
-    def _run_gesture_collection(self):
-        """รัน gesture collection"""
-        self._statusbar.showMessage("Running gesture collection...")
-        self._run_script("calibration/gesture_collection.py")
     
     def _run_signal_recorder(self):
         """บันทึกสัญญาณสำหรับจูนการตรวจจับท่าทาง"""
@@ -515,6 +576,12 @@ class MainWindow(QMainWindow):
         self.pipeline.cursor_predictor.set_speed(
             settings.get("speed", 1.0)
         )
+        self.pipeline.cursor_predictor.set_deadzone(settings.get("stability", 24))
+        self.pipeline.set_cursor_mode(settings.get("cursor_mode", "hybrid"))
+        self.pipeline.pointer.set_speed(settings.get("speed", 1.0))
+        self.pipeline.pointer.set_stability(settings.get("stability", 24))
+        self.pipeline.pointer.set_smoothing(settings.get("smoothing", 5))
+        self._update_model_status()
         self.pipeline.cursor_predictor.set_inversion(
             settings.get("invert_x", False),
             settings.get("invert_y", False)

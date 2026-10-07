@@ -69,18 +69,17 @@ def run_cli():
         print("\n  เลือกฟังก์ชัน:")
         print("  ─────────────────────────────────")
         print("  1. 📐 บันทึกค่าฐาน (Baseline)")
-        print("  2. 🎯 9-Point Calibration")
-        print("  3. ✋ เก็บข้อมูลท่าทาง (Gesture Collection)")
+        print("  2. 🎯 Calibration (13 จุด) — สำหรับโหมด hybrid/absolute")
+        print("  3. 🎙  บันทึกสัญญาณท่าทาง (Record Signals)")
         print("  4. 🏋️  เทรนโมเดล Cursor (Regression)")
-        print("  5. 🏋️  เทรนโมเดล Click (Classification)")
-        print("  6. 📊 ประเมินผลโมเดล")
-        print("  7. ▶  เริ่มควบคุมเมาส์ด้วยสายตา")
-        print("  8. 🎙  บันทึกสัญญาณสำหรับจูนท่าทาง (Record Signals)")
-        print("  9. 🔧 จูนค่าการตรวจจับท่าทาง/scroll (Tune Gestures)")
+        print("  5. 🔧 จูนค่าหา episode / ยิ้ม / scroll (Tune Gestures)")
+        print("  6. 🏋️  เทรนโมเดล Click (Classification)")
+        print("  7. 📊 ประเมินผลโมเดล")
+        print("  8. ▶  เริ่มควบคุมเมาส์ด้วยสายตา")
         print("  0. ❌ ออก")
         print("  ─────────────────────────────────")
         
-        choice = input("  เลือก [0-9]: ").strip()
+        choice = input("  เลือก [0-8]: ").strip()
         
         if choice == "0":
             print("\n  👋 ออกจากโปรแกรม")
@@ -94,22 +93,24 @@ def run_cli():
             cal = NinePointCalibration()
             cal.run()
         elif choice == "3":
-            from calibration.gesture_collection import GestureCollector
-            collector = GestureCollector()
-            collector.run()
+            from calibration.signal_recorder import SignalRecorder
+            SignalRecorder().run()
         elif choice == "4":
             from training.train_cursor_model import main as train_cursor
             train_cursor()
         elif choice == "5":
-            from training.train_click_model import main as train_click
-            train_click()
+            from training.tune_gestures import main as tune_gestures
+            sys.argv = [sys.argv[0]]
+            tune_gestures()
         elif choice == "6":
+            from training.train_click_model import main as train_click
+            train_click([])
+        elif choice == "7":
             from training.evaluate import generate_full_report
             generate_full_report()
-        elif choice == "7":
+        elif choice == "8":
             print("\n  🔄 กำลังเตรียมระบบ...")
             from core.pipeline import Pipeline
-            import cv2
             
             pipe = Pipeline()
             if pipe.initialize():
@@ -135,15 +136,8 @@ def run_cli():
                     pipe.stop()
             else:
                 print("  ❌ ไม่สามารถเริ่มระบบได้")
-        elif choice == "8":
-            from calibration.signal_recorder import SignalRecorder
-            SignalRecorder().run()
-        elif choice == "9":
-            from training.tune_gestures import main as tune_gestures
-            sys.argv = [sys.argv[0]]
-            tune_gestures()
         else:
-            print("  ⚠️ กรุณาเลือก 0-9")
+            print("  ⚠️ กรุณาเลือก 0-8")
 
 
 def main():

@@ -9,7 +9,17 @@ EYE ORDER COME AI — Train Cursor Model (Regression)
   4. Gradient Boosting Regressor
   5. MLPRegressor (Neural Network)
 
-Metrics: MAE, RMSE, R² Score
+ขั้นตอน:
+  1. ทำความสะอาด: ตัดเฟรมช่วงศีรษะกำลังเคลื่อนที่ + ค่าผิดปกติ
+  2. Feature selection: เทียบชุดฟีเจอร์ด้วย GroupKFold CV แล้วเลือกชุดที่ MAE ต่ำสุด
+     (nose_x/nose_y เป็น "ตำแหน่งหน้า" เปลี่ยนตามท่านั่ง ส่วน nose_offset เป็น "การหมุนหัว" ล้วน)
+  3. เปรียบเทียบ 5 อัลกอริทึมบนชุดฟีเจอร์ที่เลือก (GridSearchCV + GroupKFold แยกตามการเยี่ยมจุด)
+  4. Metrics จาก out-of-fold prediction ของทุกการเยี่ยมจุด: MAE, RMSE, R², jitter
+
+ทุกโมเดลถูกห่อด้วย EdgeSafeRegressor (core/cursor_models.py): นอกช่วงที่ calibrate จะต่อเนื่อง
+แบบเชิงเส้น → หันหัวเลยขอบจอแล้วเคอร์เซอร์ "ติดขอบ" ไม่วิ่งกลับเข้ากลางจอ
+
+Metrics: MAE, RMSE, R² Score, Jitter (ค่าสั่นของเคอร์เซอร์ตอนหัวนิ่ง)
 """
 import os
 import sys
@@ -25,7 +35,8 @@ matplotlib.use('Agg')  # ใช้ backend ที่ไม่ต้องแส�
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.linear_model import Ridge
@@ -42,13 +53,22 @@ warnings.filterwarnings('ignore')
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import (
-    CALIBRATION_DATA_PATH, CURSOR_MODEL_PATH, MODELS_DIR, DATA_DIR
+    CALIBRATION_DATA_PATH, CURSOR_MODEL_PATH, DATA_DIR
 )
-from core.feature_extractor import FeatureExtractor
-from utils.math_utils import fold_head_angle
+from core.cursor_models import EdgeSafeRegressor
+from core.feature_extractor import CURSOR_FEATURE_NAMES, CURSOR_FEATURE_VERSION
 
-# เวอร์ชันของนิยามฟีเจอร์ — v2 = pitch/roll พับเข้าช่วง [-90, 90] (v1 วนข้าม ±180°)
-FEATURE_VERSION = 2
+FEATURE_VERSION = CURSOR_FEATURE_VERSION
+ALL_FEATURES = list(CURSOR_FEATURE_NAMES)
+# ชุดฟีเจอร์ที่นำมาเทียบ (feature selection)
+FEATURE_SETS = {
+    "Head pose matrix (yaw/pitch)": ["head_yaw", "head_pitch"],
+    "Head pose + roll": ["head_yaw", "head_pitch", "head_roll"],
+    "Nose offset (x/y)": ["nose_offset_x", "nose_offset_y"],
+    "Head pose + nose offset": ["head_yaw", "head_pitch", "nose_offset_x", "nose_offset_y"],
+    "All 7 features": ALL_FEATURES,
+}
+CV_FOLDS = 6
 # ตัดเฟรมแรกของแต่ละจุดทิ้ง: ศีรษะยังเคลื่อนมาไม่ถึงจุด ทั้งที่ label เป็นจุดนั้นแล้ว
 SETTLE_FRAMES = 15
 # โมเดลที่ให้ผลลัพธ์ "ต่อเนื่อง" เหมาะกับการคุมเคอร์เซอร์ (ต้นไม้ให้ค่าเป็นขั้นบันได คุมยาก)
@@ -74,7 +94,7 @@ def _clean(df, groups):
     
     def keep(g):
         ok = np.ones(len(g), dtype=bool)
-        for c in ("nose_x", "nose_y", "yaw", "pitch", "roll"):
+        for c in ("head_yaw", "head_pitch", "nose_offset_x", "nose_offset_y"):
             med = g[c].median()
             mad = (g[c] - med).abs().median() * 1.4826 + 1e-6
             ok &= ((g[c] - med).abs() <= 3.0 * mad).values
@@ -85,7 +105,7 @@ def _clean(df, groups):
 
 
 def load_data(data_path=None):
-    """โหลดข้อมูล calibration (รองรับไฟล์เก่าที่ pitch/roll วนข้าม ±180°)
+    """โหลดข้อมูล calibration
     
     Returns:
         tuple: (X, y, df, groups) หรือ None ถ้าไม่มีข้อมูล
@@ -102,10 +122,10 @@ def load_data(data_path=None):
     df = pd.read_csv(data_path)
     print(f"  📂 โหลดข้อมูล: {data_path}")
     print(f"     ขนาด: {df.shape[0]} ตัวอย่าง × {df.shape[1]} columns")
-    
-    # ไฟล์จากเวอร์ชันเก่าเก็บ pitch/roll ใกล้ ±180° → พับกลับ (ค่าที่พับแล้วไม่เปลี่ยน)
-    df["pitch"] = fold_head_angle(df["pitch"].values)
-    df["roll"] = fold_head_angle(df["roll"].values)
+    missing = [c for c in ALL_FEATURES if c not in df.columns]
+    if missing:
+        print(f"  ❌ ข้อมูล calibration เป็นรุ่นเก่า (ไม่มี {missing}) — กด Calibrate ใหม่")
+        return None
     
     groups = _assign_groups(df)
     n_raw = len(df)
@@ -113,11 +133,43 @@ def load_data(data_path=None):
     print(f"     หลังตัดเฟรมช่วงเคลื่อนที่/ค่าผิดปกติ: {len(df)}/{n_raw} ตัวอย่าง "
           f"({df['g'].nunique()} การเยี่ยมจุด)")
     
-    feature_names = FeatureExtractor.get_cursor_feature_names()
-    X = df[feature_names].values
+    X = df[ALL_FEATURES].values
     y = df[["screen_x", "screen_y"]].values
     
     return X, y, df, df["g"].values
+
+
+def _jitter_xy(df, pred):
+    """ค่าสั่นของเคอร์เซอร์ตอนหัวนิ่ง แยกแกน = median ของ std ภายในการเยี่ยมจุดเดียวกัน (px)"""
+    d = pd.DataFrame({"g": df["g"].values, "px": pred[:, 0], "py": pred[:, 1]})
+    s = d.groupby("g")[["px", "py"]].std().median()
+    return float(s["px"]), float(s["py"])
+
+
+def _jitter(df, pred):
+    return float(np.mean(_jitter_xy(df, pred)))
+
+
+def _cv(groups):
+    return GroupKFold(n_splits=min(CV_FOLDS, len(np.unique(groups))))
+
+
+def select_feature_set(df, y, groups):
+    """Feature selection: เทียบชุดฟีเจอร์ด้วยโมเดลอ้างอิง (SVR) + GroupKFold CV"""
+    print("\n" + "=" * 70)
+    print("  FEATURE SELECTION (GroupKFold CV, โมเดลอ้างอิง SVR RBF)")
+    print("=" * 70)
+    ref = make_pipeline(StandardScaler(), EdgeSafeRegressor(
+        MultiOutputRegressor(SVR(kernel="rbf", C=100, epsilon=5))))
+    rows = []
+    for name, cols in FEATURE_SETS.items():
+        pred = cross_val_predict(ref, df[cols].values, y, groups=groups, cv=_cv(groups))
+        mae = mean_absolute_error(y, pred)
+        rows.append((name, cols, mae, _jitter(df, pred)))
+        print(f"  {name:<30} MAE {mae:7.1f} px   jitter {rows[-1][3]:5.1f} px   ({len(cols)} ฟีเจอร์)")
+    best = min(rows, key=lambda r: r[2])
+    print(f"  ★ เลือก: {best[0]} → {best[1]}")
+    return best[1], rows
 
 
 def define_models():
@@ -171,75 +223,53 @@ def define_models():
     return models
 
 
-def train_and_evaluate(X_train, X_test, y_train, y_test, scaler, groups_train):
-    """เทรนทุกโมเดล + ประเมินผล
-    
+def train_and_evaluate(X, y, groups, df):
+    """เทรนทุกโมเดล (GridSearchCV) + ประเมินด้วย out-of-fold prediction ของทุกการเยี่ยมจุด
+
     Returns:
-        dict: {name: {"model": best_model, "metrics": {...}, "best_params": {...}}}
+        dict: {name: {"model": pipeline(scaler+model), "metrics": {...}, "y_pred": oof, ...}}
     """
     models = define_models()
     results = {}
+    cv = _cv(groups)
     
     print("\n" + "=" * 70)
-    print("  TRAINING & EVALUATION")
+    print("  TRAINING & EVALUATION (out-of-fold)")
     print("=" * 70)
     
     for name, config in models.items():
         print(f"\n  ── {name} ──")
         start_time = time.time()
-        
-        model = config["model"]
-        params = config["params"]
-        
-        # GridSearchCV
-        print(f"    GridSearchCV ({len(params)} param sets)...")
-        grid_search = GridSearchCV(
-            model, params,
-            cv=list(GroupKFold(n_splits=5).split(X_train, y_train, groups_train)),
-            scoring="neg_mean_absolute_error",
-            n_jobs=-1,
-            verbose=0
-        )
-        
-        grid_search.fit(X_train, y_train)
-        
+        pipe = make_pipeline(StandardScaler(), EdgeSafeRegressor(config["model"]))
+        grid = {f"{pipe.steps[-1][0]}__estimator__{k}": v for k, v in config["params"].items()}
+        grid_search = GridSearchCV(pipe, grid, cv=cv, scoring="neg_mean_absolute_error", n_jobs=-1)
+        grid_search.fit(X, y, groups=groups)
         best_model = grid_search.best_estimator_
-        best_params = grid_search.best_params_
+        best_params = {k.split("__estimator__", 1)[1]: v for k, v in grid_search.best_params_.items()}
         
-        # ทำนาย
-        y_pred = best_model.predict(X_test)
-        
-        # Metrics
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
-        
-        # MAE แยกแกน
-        mae_x = mean_absolute_error(y_test[:, 0], y_pred[:, 0])
-        mae_y = mean_absolute_error(y_test[:, 1], y_pred[:, 1])
-        
+        y_pred = cross_val_predict(best_model, X, y, groups=groups, cv=cv)
+        mae = mean_absolute_error(y, y_pred)
+        rmse = np.sqrt(mean_squared_error(y, y_pred))
+        r2 = r2_score(y, y_pred)
+        mae_x = mean_absolute_error(y[:, 0], y_pred[:, 0])
+        mae_y = mean_absolute_error(y[:, 1], y_pred[:, 1])
+        jitter_x, jitter_y = _jitter_xy(df, y_pred)
+        jitter = (jitter_x + jitter_y) / 2
         elapsed = time.time() - start_time
         
         results[name] = {
             "model": best_model,
             "best_params": best_params,
-            "metrics": {
-                "MAE": mae,
-                "MAE_X": mae_x,
-                "MAE_Y": mae_y,
-                "RMSE": rmse,
-                "R2": r2,
-            },
+            "metrics": {"MAE": mae, "MAE_X": mae_x, "MAE_Y": mae_y, "RMSE": rmse, "R2": r2,
+                        "Jitter": jitter, "Jitter_X": jitter_x, "Jitter_Y": jitter_y},
             "y_pred": y_pred,
             "train_time": elapsed,
             "smooth": name in SMOOTH_MODELS,
         }
         
         print(f"    Best params: {best_params}")
-        print(f"    MAE: {mae:.2f} px (X: {mae_x:.2f}, Y: {mae_y:.2f})")
-        print(f"    RMSE: {rmse:.2f} px")
-        print(f"    R²: {r2:.4f}")
-        print(f"    Time: {elapsed:.1f}s")
+        print(f"    MAE: {mae:.2f} px (X: {mae_x:.2f}, Y: {mae_y:.2f})  RMSE: {rmse:.2f}  "
+              f"R²: {r2:.4f}  Jitter: {jitter:.1f} px  ({elapsed:.1f}s)")
     
     return results
 
@@ -258,48 +288,26 @@ def select_best_model(results):
     return best_name, results[best_name]
 
 
-def save_model(model, scaler, name, new_mae=None, X_test_scaled=None, y_test=None, model_path=None):
-    """บันทึกโมเดล (ตรวจสอบก่อนว่าใหม่กว่าหรือดีกว่าของเดิมไหม)"""
-    if model_path is None:
-        model_path = CURSOR_MODEL_PATH
-    
+def save_model(pipeline, name, feature_cols, metrics, model_path=None):
+    """บันทึกโมเดล (เทรนบนข้อมูลทั้งหมดแล้ว) + ชุดฟีเจอร์ที่ใช้"""
+    model_path = model_path or CURSOR_MODEL_PATH
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    
-    should_save = True
-    if os.path.exists(model_path) and new_mae is not None and X_test_scaled is not None and y_test is not None:
-        try:
-            old_data = joblib.load(model_path)
-            if old_data.get("feature_version", 1) != FEATURE_VERSION:
-                raise ValueError("โมเดลเดิมใช้นิยามฟีเจอร์เวอร์ชันเก่า — เขียนทับ")
-            old_model = old_data.get("model")
-            old_scaler = old_data.get("scaler")
-            old_name = old_data.get("name", "Existing Model")
-            
-            if old_model is not None:
-                X_raw = scaler.inverse_transform(X_test_scaled)
-                X_old = old_scaler.transform(X_raw) if old_scaler else X_raw
-                old_pred = old_model.predict(X_old)
-                old_mae = mean_absolute_error(y_test, old_pred)
-                
-                if old_mae < new_mae - 0.01:
-                    should_save = False
-                    print(f"\n  🛡️ โมเดลเดิมดีกว่า! (โมเดลเดิม {old_name} MAE: {old_mae:.2f} px vs โมเดลใหม่ {name} MAE: {new_mae:.2f} px)")
-                    print("     ระบบจึงเปิดเซฟโหมดและรักษาไฟล์โมเดลเดิมไว้ ไม่ให้คะแนนดรอปครับ 👍")
-        except Exception:
-            pass
-    
-    if should_save:
-        data = {
-            "model": model,
-            "scaler": scaler,
-            "name": name,
-            "feature_version": FEATURE_VERSION,
-        }
-        joblib.dump(data, model_path)
-        print(f"\n  💾 บันทึกโมเดลที่: {model_path}")
+    scaler, model = pipeline.steps[0][1], pipeline.steps[-1][1]
+    joblib.dump({
+        "model": model,
+        "scaler": scaler,
+        "name": name,
+        "feature_version": FEATURE_VERSION,
+        "feature_cols": list(feature_cols),
+        "metrics": metrics,
+        # noise ของโมเดลเองแยกแกน (px) → CursorPredictor ใช้ปรับ deadzone ให้พอดีกับ noise แต่ละแกน
+        "noise_px": [metrics["Jitter_X"], metrics["Jitter_Y"]],
+        "trained": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, model_path)
+    print(f"\n  💾 บันทึกโมเดลที่: {model_path}")
 
 
-def plot_results(results, y_test, save_dir=None):
+def plot_results(results, y_test, save_dir=None, feature_rows=None):
     """สร้างกราฟเปรียบเทียบ
     
     Args:
@@ -395,6 +403,22 @@ def plot_results(results, y_test, save_dir=None):
     plt.savefig(os.path.join(save_dir, "cursor_error_distribution.png"), dpi=150)
     plt.close()
     
+    # ── Plot 4: Feature selection ──
+    if feature_rows:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        labels = [r[0] for r in feature_rows]
+        maes = [r[2] for r in feature_rows]
+        best = int(np.argmin(maes))
+        bars = ax.barh(labels, maes, color=["#4CAF50" if i == best else "#90A4AE"
+                                            for i in range(len(labels))])
+        for bar, v in zip(bars, maes):
+            ax.text(v + 1, bar.get_y() + bar.get_height() / 2, f"{v:.1f}", va="center")
+        ax.set_xlabel("MAE (pixels, GroupKFold CV)")
+        ax.set_title("Cursor Feature Selection (SVR RBF)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "cursor_feature_selection.png"), dpi=150)
+        plt.close()
+
     print(f"\n  📊 กราฟบันทึกที่: {save_dir}")
 
 
@@ -404,7 +428,7 @@ def print_summary_table(results):
     print("  SUMMARY — CURSOR REGRESSION MODEL COMPARISON")
     print("=" * 80)
     print(f"  {'Model':<25} {'MAE':>8} {'MAE_X':>8} {'MAE_Y':>8} "
-          f"{'RMSE':>8} {'R²':>8} {'Time':>8}")
+          f"{'RMSE':>8} {'R²':>8} {'Jitter':>7} {'Time':>8}")
     print("  " + "-" * 75)
     
     best_name, _ = select_best_model(results)
@@ -413,7 +437,7 @@ def print_summary_table(results):
         m = res["metrics"]
         marker = " ★" if name == best_name else (" (ขั้นบันได)" if not res.get("smooth") else "")
         print(f"  {name:<25} {m['MAE']:>7.2f} {m['MAE_X']:>7.2f} "
-              f"{m['MAE_Y']:>7.2f} {m['RMSE']:>7.2f} {m['R2']:>7.4f} "
+              f"{m['MAE_Y']:>7.2f} {m['RMSE']:>7.2f} {m['R2']:>7.4f} {m['Jitter']:>7.1f} "
               f"{res['train_time']:>6.1f}s{marker}")
     
     print("  " + "-" * 75)
@@ -431,45 +455,27 @@ def main():
     data = load_data()
     if data is None:
         return
-    X, y, df, groups = data
+    _, y, df, groups = data
+    print(f"\n  Targets: Screen_X, Screen_Y   ตัวอย่าง: {len(y)}   "
+          f"การเยี่ยมจุด: {len(np.unique(groups))} (แบ่ง fold ตามนี้ ไม่รั่ว)")
     
-    print(f"\n  Features: {X.shape[1]} ตัวแปร")
-    print(f"  Targets: Screen_X, Screen_Y")
-    print(f"  ตัวอย่าง: {X.shape[0]}")
+    # 2. Feature selection
+    feature_cols, feature_rows = select_feature_set(df, y, groups)
+    X = df[feature_cols].values
     
-    # 2. Train/Test Split — แบ่งตามกลุ่ม (การเยี่ยมจุด) ไม่ใช่ทีละแถว
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(X, y, groups))
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
-    groups_train = groups[train_idx]
-    print(f"\n  Train: {X_train.shape[0]} | Test: {X_test.shape[0]} (แบ่งตามกลุ่ม ไม่รั่ว)")
+    # 3. เทรนและประเมิน 5 โมเดล
+    results = train_and_evaluate(X, y, groups, df)
     
-    # 3. Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    # 4. เทรนและประเมิน
-    results = train_and_evaluate(
-        X_train_scaled, X_test_scaled, y_train, y_test, scaler, groups_train
-    )
-    
-    # 5. แสดงสรุป
+    # 4. สรุป + เลือกโมเดล
     print_summary_table(results)
-    
-    # 6. เลือกโมเดลที่ดีที่สุด
     best_name, best_result = select_best_model(results)
     
-    # 7. บันทึกโมเดล (มีระบบป้องกันถ้าของเดิมดีกว่า)
-    save_model(
-        best_result["model"], scaler, best_name,
-        new_mae=best_result["metrics"]["MAE"],
-        X_test_scaled=X_test_scaled, y_test=y_test
-    )
+    # 5. เทรนตัวที่เลือกบนข้อมูลทั้งหมด แล้วบันทึก
+    final = best_result["model"].fit(X, y)
+    save_model(final, best_name, feature_cols, best_result["metrics"])
     
-    # 8. สร้างกราฟ
-    plot_results(results, y_test)
+    # 6. กราฟ (ใช้ out-of-fold prediction)
+    plot_results(results, y, feature_rows=feature_rows)
     
     print("\n  ✅ การเทรนเสร็จสมบูรณ์!")
     return results
