@@ -1,11 +1,11 @@
 {
-  "baseline_mouth_ratio": 0.6465012904993936,
-  "baseline_pitch": 0.04365116046489502,
-  "head_yaw": -0.8882383192067729,
-  "head_pitch": -1.4664600693696443,
+  "baseline_mouth_ratio": 0.6201495243132086,
+  "baseline_pitch": 0.03945784237893869,
+  "head_yaw": -1.2766701969233132,
+  "head_pitch": -0.928711786463024,
   "mirror": true,
-  "baseline_ear_l": 0.2924602924349072,
-  "baseline_ear_r": 0.3189907247321252,
+  "baseline_ear_l": 0.2988389810997302,
+  "baseline_ear_r": 0.30593353510550686,
   "ear_version": 2,
-  "num_frames": 162
+  "num_frames": 161
 }
